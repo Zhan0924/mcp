@@ -1,0 +1,146 @@
+# RAG MCP Server 配置文件
+# 值中 ${VAR_NAME} 会被自动替换为对应环境变量
+
+[server]
+port = 8082
+name = "rag-mcp-server"
+version = "2.0.0"
+max_content_size = 10485760  # 10MB
+instance_id = "mcp_rag_server"  # 每个实例唯一标识，用于 worker consumer name + 日志
+
+[redis]
+# 模式: "standalone" (默认) / "sentinel" / "cluster"
+mode = "standalone"
+addr = "redis-stack:6379"
+# sentinel/cluster 时使用 addrs (多地址)
+# addrs = ["redis-node1:6379", "redis-node2:6379", "redis-node3:6379"]
+# master_name = "mymaster"  # sentinel 模式必填
+password = "123456"
+db = 0
+dial_timeout = "5s"
+read_timeout = "10s"
+write_timeout = "10s"
+pool_size = 20
+
+[retriever]
+# Cluster 模式建议使用 Hash Tag 模板确保同用户数据在同一 slot:
+#   user_index_name_template = "mcp_rag_{user_%d}:idx"
+#   user_index_prefix_template = "mcp_rag_{user_%d}:"
+user_index_name_template = "mcp_rag_user_%d:idx"
+user_index_prefix_template = "mcp_rag_user_%d:"
+vector_field_name = "vector"
+return_fields = ["content", "file_id", "file_name", "chunk_id", "chunk_index", "distance"]
+search_dialect = 2
+default_top_k = 5
+max_top_k = 20
+min_score = 0.5
+
+# 索引算法: "FLAT" (适合 <100万向量) 或 "HNSW" (适合大规模数据)
+index_algorithm = "FLAT"
+hnsw_m = 16
+hnsw_ef_construction = 200
+hnsw_ef_runtime = 10
+
+# 批量操作参数
+embedding_batch_size = 10
+pipeline_batch_size = 500
+
+# 混合检索 (BM25 全文 + 向量语义)
+hybrid_search_enabled = false
+vector_weight = 0.7
+keyword_weight = 0.3
+
+[chunking]
+max_chunk_size = 1000
+min_chunk_size = 100
+overlap_size = 200
+structure_aware = true  # 启用 Markdown 结构感知分块
+
+[embedding_manager]
+strategy = "priority"
+max_retries = 3
+retry_delay = "1s"
+retry_max_delay = "30s"
+retry_multiplier = 2.0
+circuit_threshold = 5
+circuit_timeout = "30s"
+circuit_half_open_max = 3
+health_check_interval = "60s"
+health_check_timeout = "10s"
+
+# Embedding 缓存
+[cache]
+enabled = true
+local_max_size = 10000
+local_ttl = "30m"
+redis_enabled = false
+redis_ttl = "24h"
+redis_prefix = "emb_cache:"
+deduplicate_on = true  # 索引时对相同内容跳过重复 embedding
+
+# Rerank 重排序 — 基于阿里云百炼 DashScope
+# 支持模型:
+#   qwen3-rerank      — 最大 500 条文档, 单条最大 4000 Token, 100+ 语种
+#   gte-rerank-v2     — 最大 30000 条文档, 50+ 语种
+#   qwen3-vl-rerank   — 多模态 (文本+图片+视频), 最大 100 条, 33 语种
+[rerank]
+enabled = true
+provider = "dashscope"
+# qwen3-rerank 使用兼容 API, base_url 留空自动选择
+# 如需自定义:
+#   qwen3-rerank:   https://dashscope.aliyuncs.com/compatible-api/v1/reranks
+#   gte-rerank-v2:  https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
+base_url = "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"
+api_key = "xxxxxxxxxxxxxxxxxxxxx"
+model = "qwen3-rerank"
+top_n = 5               # 最终返回的精排结果数
+recall_top_k = 20       # 初始召回数（应 >= top_n）
+timeout = "15s"
+# 排序任务说明 (仅 qwen3-rerank / qwen3-vl-rerank 生效)
+# 问答检索(默认): "Given a web search query, retrieve relevant passages that answer the query."
+# 语义相似度:     "Retrieve semantically similar text."
+instruct = "Given a web search query, retrieve relevant passages that answer the query."
+
+# 异步索引 — 基于 Redis Streams 的分布式任务队列
+[async_index]
+enabled = true                     # 是否启用异步索引
+stream_key = "rag:index:tasks"      # Redis Stream key
+group_name = "rag-workers"          # 消费者组名称
+status_prefix = "rag:task:"         # 任务状态 key 前缀
+worker_count = 3                    # 每实例并发 worker 数
+task_ttl = "24h"                    # 任务状态保留时间
+claim_timeout = "300s"              # PEL 消息超时后可被其他 worker XCLAIM
+
+# Schema 迁移 — 索引 Schema 版本化 + 蓝绿重建
+[migration]
+enabled = true
+auto_migrate_on_startup = true      # 启动时自动检查并迁移
+meta_prefix = "rag:schema:"         # schema 元信息存储前缀
+batch_size = 1000                   # 数据迁移批量大小
+
+# Embedding Providers（可配置多个，支持故障转移）
+
+[[embedding_providers]]
+name = "primary-dashscope"
+type = "openai"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key = "xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+model = "text-embedding-v4"
+dimension = 1024
+priority = 1
+weight = 100
+max_qps = 50
+timeout = "30s"
+enabled = true
+
+[[embedding_providers]]
+name = "fallback-openai"
+type = "openai"
+base_url = "https://api.openai.com/v1"
+api_key = "${OPENAI_API_KEY}"
+model = "text-embedding-3-small"
+dimension = 1536
+priority = 2
+weight = 50
+timeout = "30s"
+enabled = false

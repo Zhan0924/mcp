@@ -1,0 +1,207 @@
+# Go 语言并发编程完全指南
+
+## 1. Goroutine 基础与调度器
+
+Go 语言的并发模型基于 CSP（Communicating Sequential Processes）理论，由 Tony Hoare 于 1978 年提出。Goroutine 是 Go 运行时管理的轻量级线程，创建一个 Goroutine 的开销仅约 2KB 初始栈空间，远小于操作系统线程默认的 1MB 栈空间。这意味着在同一台机器上可以轻松启动数十万个 Goroutine，而如果使用操作系统线程，通常只能启动数千个。
+
+启动一个 Goroutine 非常简单，只需在函数调用前加上 `go` 关键字：
+
+```go
+go func() {
+    fmt.Println("Hello from goroutine")
+}()
+```
+
+### 1.1 GMP 调度模型
+
+Go 运行时使用 M:N 调度模型，将 M 个 Goroutine 映射到 N 个操作系统线程上执行。调度器使用三个核心结构：
+
+- **G（Goroutine）**：表示一个 Goroutine，包含栈、指令指针和其他调度相关信息
+- **M（Machine）**：代表操作系统线程，是实际执行计算的载体
+- **P（Processor）**：逻辑处理器，维护一个本地 Goroutine 运行队列，P 的数量默认等于 CPU 核心数
+
+### 1.2 工作窃取（Work Stealing）
+
+当某个 P 的本地运行队列为空时，调度器会执行工作窃取：首先尝试从全局运行队列获取 Goroutine，如果全局队列也为空，则随机从其他 P 的本地队列中窃取一半的 Goroutine。这种机制保证了所有 CPU 核心都能得到充分利用，避免了某些核心空闲而其他核心过载的情况。
+
+工作窃取算法的核心在于负载均衡——它确保即使任务分布不均匀，系统也能自适应地平衡各个处理器的工作负载。Go 1.14 引入了基于信号的异步抢占机制，解决了之前版本中某些紧密循环可能导致其他 Goroutine 饥饿的问题。
+
+### 1.3 Goroutine 栈管理
+
+Go 使用连续栈（Contiguous Stack）方案管理 Goroutine 栈。初始栈大小为 2KB，当栈空间不足时会自动扩容（通常翻倍），当栈使用率低于一定阈值时会自动缩小。这种动态管理机制既节省了内存，又避免了栈溢出的风险。
+
+## 2. Channel 通信机制
+
+Channel 是 Go 中 Goroutine 之间通信的核心机制。它遵循 "Don't communicate by sharing memory; share memory by communicating" 的设计哲学。Channel 本质上是一个带有类型信息的先进先出（FIFO）队列，提供了类型安全的通信机制。
+
+### 2.1 无缓冲 Channel（同步通信）
+
+无缓冲 Channel 提供了强同步语义：发送操作会阻塞，直到有另一个 Goroutine 执行接收操作；同样，接收操作也会阻塞，直到有发送方准备好数据。这种机制天然地实现了 Goroutine 之间的同步，无需额外的锁机制。
+
+```go
+ch := make(chan int)
+go func() {
+    ch <- 42  // 阻塞直到有接收者
+}()
+value := <-ch  // 阻塞直到有发送者
+```
+
+### 2.2 有缓冲 Channel（异步通信）
+
+有缓冲 Channel 在缓冲区未满时允许异步发送。缓冲区的大小决定了在阻塞之前可以发送的消息数量。选择合适的缓冲区大小对性能至关重要：太小可能导致频繁阻塞，太大则浪费内存并可能掩盖设计问题。
+
+```go
+ch := make(chan int, 100)
+ch <- 1  // 不会阻塞（缓冲区未满）
+```
+
+### 2.3 Select 多路复用
+
+Select 语句用于同时等待多个 Channel 操作，当多个 case 同时就绪时，Go 运行时会随机选择一个执行，保证公平性：
+
+```go
+select {
+case msg := <-ch1:
+    handleMessage(msg)
+case msg := <-ch2:
+    handleRequest(msg)
+case <-time.After(5 * time.Second):
+    handleTimeout()
+default:
+    handleDefault()
+}
+```
+
+### 2.4 Channel 方向约束
+
+Go 支持单向 Channel 类型，可以在函数签名中限制 Channel 只能发送或只能接收，增强类型安全：
+
+```go
+func producer(out chan<- int) { out <- 42 }
+func consumer(in <-chan int) { v := <-in }
+```
+
+## 3. 同步原语
+
+### 3.1 sync.Mutex 和 sync.RWMutex
+
+互斥锁用于保护共享资源的并发访问。sync.Mutex 提供排他锁语义，sync.RWMutex 提供读写锁语义——允许多个读操作并发执行，但写操作是排他的。在读多写少的场景下，RWMutex 比 Mutex 有更好的并发性能。
+
+```go
+var mu sync.RWMutex
+var cache map[string]string
+
+func read(key string) string {
+    mu.RLock()
+    defer mu.RUnlock()
+    return cache[key]
+}
+
+func write(key, value string) {
+    mu.Lock()
+    defer mu.Unlock()
+    cache[key] = value
+}
+```
+
+### 3.2 sync.WaitGroup
+
+WaitGroup 用于等待一组 Goroutine 全部完成。它内部维护一个计数器，Add 增加计数、Done 减少计数、Wait 阻塞直到计数归零。需要注意的是，Add 必须在对应的 Goroutine 启动之前调用，否则可能出现竞争条件。
+
+```go
+var wg sync.WaitGroup
+for i := 0; i < 10; i++ {
+    wg.Add(1)
+    go func(id int) {
+        defer wg.Done()
+        processTask(id)
+    }(i)
+}
+wg.Wait()
+```
+
+### 3.3 sync.Once 和 sync.Pool
+
+sync.Once 确保某个操作只执行一次，常用于单例模式的线程安全初始化。sync.Pool 是一个临时对象池，用于缓存已分配但暂时不用的对象，减少 GC 压力。Pool 中的对象可能在任何时候被回收，因此不适合存储持久化数据。
+
+### 3.4 sync.Map
+
+sync.Map 是 Go 内置的并发安全 Map 实现，适合以下两种场景：一是 key 集合稳定、读多写少的情况（如缓存）；二是多个 Goroutine 读写不相交的 key 集合。对于其他场景，使用普通 map 加 sync.RWMutex 通常性能更好。
+
+### 3.5 sync/atomic 包
+
+atomic 包提供了底层的原子内存操作，适用于简单的计数器、标志位等场景。与锁相比，原子操作开销更低，但只适用于简单的数值类型操作。Go 1.19 引入了 atomic.Int64、atomic.Bool 等泛型原子类型，使用更加便捷。
+
+## 4. Context 上下文
+
+context.Context 是 Go 并发编程的基础设施，用于在 Goroutine 树中传播取消信号、截止时间和请求级别的元数据。每个长时间运行的函数都应该接受 Context 作为第一个参数。
+
+### 4.1 Context 类型
+
+- **context.Background()**：根 Context，通常在 main 函数或顶层初始化中使用
+- **context.WithCancel(parent)**：创建可取消的子 Context
+- **context.WithTimeout(parent, duration)**：在指定时间后自动取消
+- **context.WithDeadline(parent, time)**：在指定时刻自动取消
+- **context.WithValue(parent, key, val)**：附加请求级别的键值对
+
+### 4.2 Context 最佳实践
+
+Context 应该以参数方式显式传递，不要存储在结构体中。不要传递 nil Context，如果不确定使用哪个 Context，使用 context.TODO()。Context 的 WithValue 只应用于传递请求作用域的元数据（如 trace ID、认证信息），不应用于传递可选的函数参数。取消操作是幂等的，多次调用 cancel 函数是安全的。
+
+## 5. 并发模式
+
+### 5.1 Fan-Out / Fan-In 模式
+
+Fan-Out 将一个输入 Channel 分发给多个 Worker Goroutine 并行处理；Fan-In 将多个 Worker 的输出合并到一个输出 Channel。这种模式非常适合 CPU 密集型任务的并行化处理，如批量数据转换、并行 API 调用等。
+
+### 5.2 Pipeline 流水线模式
+
+Pipeline 将数据处理分为多个阶段，每个阶段由独立的 Goroutine 执行，阶段之间通过 Channel 连接。Pipeline 的优势在于每个阶段可以独立调优并发度，适合数据流处理场景。
+
+### 5.3 Worker Pool 工作池模式
+
+Worker Pool 使用固定数量的 Goroutine 处理任务队列，避免了无限制创建 Goroutine 可能导致的资源耗尽。可以使用带缓冲 Channel 作为 Semaphore（信号量）来控制并发度。
+
+### 5.4 Error Group 模式
+
+errgroup.Group（golang.org/x/sync/errgroup）将多个 Goroutine 视为一组，任何一个返回错误时自动取消其余 Goroutine。这是处理多个并发任务且需要统一错误处理的首选方案。
+
+## 6. 常见陷阱与注意事项
+
+### 6.1 Goroutine 泄漏
+
+Goroutine 泄漏是最常见的并发 Bug 之一。如果一个 Goroutine 永远阻塞在 Channel 操作或锁等待上，它就不会被垃圾回收，造成内存泄漏。预防方法包括：始终使用 Context 控制 Goroutine 生命周期、确保 Channel 最终会被关闭或解除阻塞、使用 go vet 和 goleak 工具检测泄漏。
+
+### 6.2 Race Condition 数据竞争
+
+并发访问共享变量时如果没有适当的同步机制，就会出现数据竞争。Go 提供了内置的竞争检测器（Race Detector），通过 `go test -race` 或 `go run -race` 来启用。在 CI/CD 流程中始终启用竞争检测是最佳实践。
+
+### 6.3 死锁（Deadlock）
+
+当两个或多个 Goroutine 互相等待对方持有的资源时，就会发生死锁。Go 运行时只能检测到所有 Goroutine 都在等待的全局死锁情况。对于局部死锁，需要通过良好的设计来预防：保持一致的锁获取顺序、使用超时机制、避免在持有锁时调用外部函数。
+
+### 6.4 Channel 误用
+
+常见的 Channel 误用包括：向已关闭的 Channel 发送数据（会 panic）、重复关闭 Channel（会 panic）、在错误的 Goroutine 中关闭 Channel。遵循 "谁创建谁关闭" 或 "发送方关闭" 的原则可以避免这些问题。
+
+## 7. 性能调优
+
+### 7.1 GOMAXPROCS 设置
+
+GOMAXPROCS 控制同时运行 Goroutine 的最大 OS 线程数。默认值等于 CPU 核心数，大多数情况下不需要修改。在容器化环境（如 Kubernetes）中，需要注意 Go 运行时可能无法正确检测容器的 CPU 限制，可以使用 uber-go/automaxprocs 自动适配。
+
+### 7.2 减少锁竞争
+
+锁竞争是并发程序性能的主要瓶颈。减少锁竞争的策略包括：减小临界区范围（只在必要时持有锁）、使用分片锁（将一个大锁拆分为多个小锁）、使用无锁数据结构（如 atomic 操作）、使用 Channel 替代共享内存。
+
+### 7.3 Goroutine 池化
+
+虽然 Goroutine 创建成本低，但在高频场景下（如每个 HTTP 请求创建 Goroutine），频繁创建和销毁仍然会带来 GC 压力。使用 Goroutine 池（如 ants 库）可以复用 Goroutine，降低延迟和内存消耗。
+
+### 7.4 Profile 和 Trace 工具
+
+Go 内置了强大的性能分析工具：pprof 用于 CPU、内存、Goroutine 等 Profile 分析；runtime/trace 用于可视化 Goroutine 调度情况；go tool trace 可以生成交互式的执行时间线，帮助发现调度延迟和阻塞瓶颈。
+
+### 7.5 Benchmark 测试
+
+使用 Go 内置的 benchmark 框架可以精确测量并发代码的性能。testing.B 提供了 RunParallel 方法来测试并行性能，配合 -benchmem 标志可以同时分析内存分配情况。通过对比不同实现的 benchmark 结果，可以做出数据驱动的优化决策。
