@@ -8,7 +8,7 @@ services:
     container_name: mcp-rag-server
     restart: unless-stopped
     ports:
-      - "8082:8082"
+      - "8082:8083" # 修复：容器内部根据 config.toml 实际上是监听 8083 端口
     environment:
       # 传入环境变量覆盖 API Key 等敏感配置 (根据 config.toml 中定义的 ${VAR_NAME} 替换逻辑)
       - REDIS_PASSWORD=${REDIS_PASSWORD:-123456}
@@ -26,8 +26,8 @@ services:
     container_name: redis-stack
     restart: unless-stopped
     ports:
-      - "6379:6379"
-      - "8001:8001" # RedisInsight 面板端口
+      - "6380:6379" # 宿主机端口占用，将对外映射改为 6380 (容器内部依然是 6379)
+      - "8002:8001" # 宿主机 8001 端口也被占用，对外映射面板改用 8002
     environment:
       # 配置 redis 密码
       - REDIS_ARGS=--requirepass ${REDIS_PASSWORD:-123456}

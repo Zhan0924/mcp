@@ -2,7 +2,7 @@
 # 值中 ${VAR_NAME} 会被自动替换为对应环境变量
 
 [server]
-port = 8082
+port = 8083
 name = "rag-mcp-server"
 version = "2.0.0"
 max_content_size = 10485760  # 10MB
@@ -10,6 +10,7 @@ instance_id = "mcp_rag_server"  # 每个实例唯一标识，用于 worker consu
 
 [redis]
 # 模式: "standalone" (默认) / "sentinel" / "cluster"
+# 容器内访问 Redis 必须用 6379；宿主机访问映射端口用 localhost:6380
 mode = "standalone"
 addr = "redis-stack:6379"
 # sentinel/cluster 时使用 addrs (多地址)
@@ -17,7 +18,7 @@ addr = "redis-stack:6379"
 # master_name = "mymaster"  # sentinel 模式必填
 password = "123456"
 db = 0
-dial_timeout = "5s"
+dial_timeout = "10s"
 read_timeout = "10s"
 write_timeout = "10s"
 pool_size = 20
@@ -91,7 +92,7 @@ provider = "dashscope"
 #   qwen3-rerank:   https://dashscope.aliyuncs.com/compatible-api/v1/reranks
 #   gte-rerank-v2:  https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
 base_url = "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"
-api_key = "xxxxxxxxxxxxxxxxxxxxx"
+api_key = "${DASHSCOPE_API_KEY}"
 model = "qwen3-rerank"
 top_n = 5               # 最终返回的精排结果数
 recall_top_k = 20       # 初始召回数（应 >= top_n）
@@ -124,7 +125,7 @@ batch_size = 1000                   # 数据迁移批量大小
 name = "primary-dashscope"
 type = "openai"
 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-api_key = "xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+api_key = "${DASHSCOPE_API_KEY}"
 model = "text-embedding-v4"
 dimension = 1024
 priority = 1
