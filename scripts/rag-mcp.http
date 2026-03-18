@@ -1,0 +1,194 @@
+### RAG MCP Server 测试（共 18 个用例）
+### 使用前请先启动服务（二选一）：
+###   - Docker: docker-compose up -d  → 用端口 8082
+###   - 本机:   ./rag-mcp-server -config config.toml  → 用端口 8083
+### 运行顺序：先执行请求 1，将 Mcp-Session-Id 填到 @sessionId；再执行 2～18。
+### 覆盖：initialize / tools/list / rag_chunk_text(2) / rag_parse_document / rag_index_document(3) / rag_search(4) / rag_build_prompt(2) / rag_task_status / rag_delete_document / rag_status(2)
+
+# Docker 启动时宿主机端口为 8082；本机直接运行时改为 8083
+@baseUrl = http://localhost:8082
+@mcpPath = {{baseUrl}}/mcp
+# 运行请求 1 后，从响应头复制 Mcp-Session-Id 的值，粘贴到下一行等号后面
+@sessionId = mcp-session-90bffed8-610a-453f-9fa1-b548898a827d
+# 运行请求 15（异步索引）后，从返回的 result.content[0].text 里取 task_id 填到下一行，再运行请求 16
+@taskId = 596e86da-9788-40d3-abf7-a04bf15177d6
+
+###############################################################################
+# 1. 初始化 MCP 会话（获取 Mcp-Session-Id，后续请求需带此头）
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"http-test","version":"1.0.0"}}}
+
+###############################################################################
+# 2. 列出工具 (tools/list) — 先运行请求 1，从响应头复制 Mcp-Session-Id 填到上方 @sessionId = 后面
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+
+###############################################################################
+# 3. 调用 rag_chunk_text（分块预览，不依赖 Redis/Embedding）
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"rag_chunk_text","arguments":{"content":"# 测试文档\n\n这是一段简短内容，用于验证 MCP 工具调用是否正常。","max_chunk_size":200,"overlap_size":50,"structure_aware":true}}}
+
+###############################################################################
+# 4. 调用 rag_index_document（同步索引，需 Redis + Embedding）
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"rag_index_document","arguments":{"content":"# Go 并发\n\nGo 通过 goroutine 实现轻量级并发。Channel 是 goroutine 之间通信的管道。","file_id":"test-go-001","user_id":1,"file_name":"go_intro.md","format":"markdown"}}}
+
+###############################################################################
+# 5. 调用 rag_search（语义检索，需先有索引数据）
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"rag_search","arguments":{"query":"Go goroutine 并发通信","user_id":1,"top_k":3}}}
+
+###############################################################################
+# 6. 调用 rag_build_prompt（RAG Prompt 构建）
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"rag_build_prompt","arguments":{"query":"解释 goroutine 和 channel 的关系","user_id":1,"top_k":3}}}
+
+###############################################################################
+# 7. 调用 rag_status（服务与索引状态）
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"rag_status","arguments":{}}}
+
+###############################################################################
+# 8. rag_chunk_text — 长文档多块 + 非结构感知（structure_aware=false）
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"rag_chunk_text","arguments":{"content":"# 第一章\n\n分布式系统由多台计算机组成。\n\n# 第二章\n\nCAP 定理指出一致性、可用性、分区容错性不可兼得。\n\n# 第三章\n\nRaft 是共识算法，通过 Leader 选举和日志复制实现一致性。","max_chunk_size":80,"overlap_size":10,"structure_aware":false}}}
+
+###############################################################################
+# 9. rag_parse_document — 仅解析文档（不建索引），检测格式与结构
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"rag_parse_document","arguments":{"content":"## Redis 向量搜索\n\nRediSearch 支持 KNN 向量检索。\n\n| 命令 | 说明 |\n|------|------|\n| FT.SEARCH | 执行搜索 |","format":"markdown"}}}
+
+###############################################################################
+# 10. rag_index_document — 索引第二篇文档（多文档检索用）
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"rag_index_document","arguments":{"content":"# Kubernetes 基础\n\nPod 是最小部署单元。Deployment 管理副本与滚动更新。Service 提供负载均衡。","file_id":"test-k8s-001","user_id":1,"file_name":"k8s_intro.md","format":"markdown"}}}
+
+###############################################################################
+# 11. rag_search — 启用 Rerank 精排
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"rag_search","arguments":{"query":"容器编排和 Pod 是什么","user_id":1,"top_k":5,"rerank":true}}}
+
+###############################################################################
+# 12. rag_search — 按 file_ids 限定在指定文件内检索
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"rag_search","arguments":{"query":"goroutine 和 channel","user_id":1,"top_k":3,"file_ids":"test-go-001"}}}
+
+###############################################################################
+# 13. rag_search — 指定 min_score 过滤低相关度结果
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"rag_search","arguments":{"query":"Go 并发模型","user_id":1,"top_k":5,"min_score":0.3}}}
+
+###############################################################################
+# 14. rag_build_prompt — 限定在指定文件内构建 prompt
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"rag_build_prompt","arguments":{"query":"Kubernetes 的 Pod 和 Service 分别做什么","user_id":1,"top_k":3,"file_ids":"test-k8s-001"}}}
+
+###############################################################################
+# 15. rag_index_document — 异步索引（需 config 中 async_index.enabled=true）
+# 返回 task_id 后可用请求 16 查询进度
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"rag_index_document","arguments":{"content":"# 异步测试文档\n\n此文档通过异步任务索引。","file_id":"test-async-001","user_id":1,"file_name":"async_doc.md","format":"markdown","async":true}}}
+
+###############################################################################
+# 16. rag_task_status — 查询异步任务状态（先运行请求 15，把返回的 task_id 填到文件顶部 @taskId）
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"rag_task_status","arguments":{"task_id":"{{taskId}}"}}}
+
+###############################################################################
+# 17. rag_delete_document — 删除指定文件的索引
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"rag_delete_document","arguments":{"file_id":"test-async-001","user_id":1}}}
+
+###############################################################################
+# 18. rag_status — 删除后再查一次状态（可选）
+###############################################################################
+POST {{mcpPath}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Session-Id: {{sessionId}}
+
+{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"rag_status","arguments":{}}}
