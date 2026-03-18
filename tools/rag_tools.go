@@ -431,6 +431,8 @@ func (p *RAGToolProvider) chunkTextTool() Tool {
 			chunks = rag.ChunkDocument(content, cfg)
 		}
 
+		logrus.Infof("[rag_chunk_text] Done: content_len=%d, chunks=%d, structure_aware=%v", len(content), len(chunks), cfg.StructureAware)
+
 		type chunkOutput struct {
 			ChunkIndex int    `json:"chunk_index"`
 			Content    string `json:"content"`
@@ -467,6 +469,7 @@ func (p *RAGToolProvider) statusTool() Tool {
 	)
 
 	return NewBaseTool(definition, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		logrus.Info("[rag_status] Status requested")
 		stats := rag.GetStats()
 
 		type providerInfo struct {
@@ -614,6 +617,8 @@ func (p *RAGToolProvider) parseDocumentTool() Tool {
 			return toolError(rag.ErrCodeParseFailed, err.Error())
 		}
 
+		logrus.Infof("[rag_parse_document] Parsed: format=%s, sections=%d, content_len=%d", doc.Format, len(doc.Sections), len(doc.Content))
+
 		type output struct {
 			Format     string                `json:"format"`
 			Metadata   rag.DocumentMetadata  `json:"metadata"`
@@ -666,6 +671,8 @@ func (p *RAGToolProvider) taskStatusTool() Tool {
 		if task == nil {
 			return toolErrorSimple("task not found (may have expired): " + taskID)
 		}
+
+		logrus.Infof("[rag_task_status] task_id=%s, status=%s, file_id=%s", taskID, task.Status, task.FileID)
 
 		data, err := json.MarshalIndent(task, "", "  ")
 		if err != nil {

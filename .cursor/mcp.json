@@ -1,0 +1,7 @@
+{
+    "mcpServers": {
+      "rag-server": {
+        "url": "http://localhost:8082/mcp"
+      }
+    }
+  }
