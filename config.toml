@@ -16,7 +16,7 @@ addr = "redis-stack:6379"
 # sentinel/cluster 时使用 addrs (多地址)
 # addrs = ["redis-node1:6379", "redis-node2:6379", "redis-node3:6379"]
 # master_name = "mymaster"  # sentinel 模式必填
-password = "123456"
+password = "${REDIS_PASSWORD}"
 db = 0
 dial_timeout = "10s"
 read_timeout = "10s"
@@ -30,11 +30,11 @@ pool_size = 20
 user_index_name_template = "mcp_rag_user_%d:idx"
 user_index_prefix_template = "mcp_rag_user_%d:"
 vector_field_name = "vector"
-return_fields = ["content", "file_id", "file_name", "chunk_id", "chunk_index", "distance"]
+return_fields = ["content", "file_id", "file_name", "chunk_id", "chunk_index", "parent_chunk_id", "distance"]
 search_dialect = 2
 default_top_k = 5
 max_top_k = 20
-min_score = 0.5
+min_score = 0.0
 
 # 索引算法: "FLAT" (适合 <100万向量) 或 "HNSW" (适合大规模数据)
 index_algorithm = "FLAT"
@@ -47,7 +47,7 @@ embedding_batch_size = 10
 pipeline_batch_size = 500
 
 # 混合检索 (BM25 全文 + 向量语义)
-hybrid_search_enabled = false
+hybrid_search_enabled = true
 vector_weight = 0.7
 keyword_weight = 0.3
 
@@ -56,6 +56,24 @@ max_chunk_size = 1000
 min_chunk_size = 100
 overlap_size = 200
 structure_aware = true  # 启用 Markdown 结构感知分块
+# 父子块检索 — 子块精确匹配，返回父块完整上下文
+parent_child_enabled = true  # 生产环境验证效果后再开启
+parent_chunk_size = 1000      # 父块大小（返回给 LLM 的上下文）
+child_chunk_size = 200        # 子块大小（用于向量匹配的精细粒度）
+
+# 语义分块 — 基于 Embedding 相似度的动态分块
+# 核心思想: 在相邻句子语义骤降处切分，保证每个 chunk 内部语义高度一致
+# 缺点: 索引时需额外 Embedding 调用，仅建议知识库文档质量要求高时启用
+[chunking.semantic_chunking]
+enabled = false               # 已测试通过
+window_size = 3               # 滑动窗口大小（句子数），越大语义信号越平滑，但断点检测越粗
+breakpoint_threshold = 1.0    # 断点阈值 (标准差倍数)，越小断点越多、chunk 越小
+max_chunk_size = 1500         # 语义分块后的最大 chunk 大小，超过则二次切割
+min_chunk_size = 100          # 语义分块后的最小 chunk 大小，低于则与邻居合并
+
+# 代码感知分块 — 以函数/类为单位切分代码文件
+# 支持: Go / Python / JavaScript / TypeScript / Java / Rust / C / C++
+code_chunking_enabled = true # 开启后代码文件自动按函数边界切分，非代码文件不受影响
 
 [embedding_manager]
 strategy = "priority"
@@ -74,7 +92,7 @@ health_check_timeout = "10s"
 enabled = true
 local_max_size = 10000
 local_ttl = "30m"
-redis_enabled = false
+redis_enabled = true
 redis_ttl = "24h"
 redis_prefix = "emb_cache:"
 deduplicate_on = true  # 索引时对相同内容跳过重复 embedding
@@ -91,9 +109,9 @@ provider = "dashscope"
 # 如需自定义:
 #   qwen3-rerank:   https://dashscope.aliyuncs.com/compatible-api/v1/reranks
 #   gte-rerank-v2:  https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
-base_url = "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"
-api_key = "${DASHSCOPE_API_KEY}"
-model = "qwen3-rerank"
+base_url = "${RERANK_BASE_URL}"
+api_key = "${RERANK_API_KEY}"
+model = "${RERANK_MODEL}"
 top_n = 5               # 最终返回的精排结果数
 recall_top_k = 20       # 初始召回数（应 >= top_n）
 timeout = "15s"
@@ -119,14 +137,104 @@ auto_migrate_on_startup = true      # 启动时自动检查并迁移
 meta_prefix = "rag:schema:"         # schema 元信息存储前缀
 batch_size = 1000                   # 数据迁移批量大小
 
+# 查询扩展 — HyDE (Hypothetical Document Embeddings)
+# 调用轻量级 LLM 生成假想答案，再用假想答案做向量检索，大幅提升召回率
+[hyde]
+enabled = true                  # 测试中
+base_url = "${HYDE_BASE_URL}"
+api_key = "${HYDE_API_KEY}"
+model = "${HYDE_MODEL}"
+max_tokens = 256
+temperature = 0.3
+timeout = "30s"
+
+# VectorStore 后端配置
+# 支持 redis / milvus / qdrant 三种后端，切换后端只需修改 type 并填写对应子配置
+[vector_store]
+type = "redis"                   # redis / milvus / qdrant
+
+# Milvus 配置（仅 type = "milvus" 时生效）
+# 适用场景: 百万级以上向量，需 GPU 加速或复杂过滤条件
+[vector_store.milvus]
+addr = "http://localhost:19530"   # Milvus RESTful API 地址
+token = "${MILVUS_TOKEN}"          # API Token (Milvus Cloud)
+database = "default"              # 数据库名
+timeout = "30s"
+metric_type = "COSINE"            # COSINE / L2 / IP
+
+# Qdrant 配置（仅 type = "qdrant" 时生效）
+# 适用场景: 低延迟、丰富过滤条件、支持稀疏+密集向量联合搜索
+[vector_store.qdrant]
+addr = "http://localhost:6333"    # Qdrant REST API 地址
+api_key = "${QDRANT_API_KEY}"      # API Key (Qdrant Cloud)
+timeout = "30s"
+
+# 多查询检索 — Multi-Query Retrieval
+# 将用户查询扩展为多个语义变体，分别检索后 RRF 融合去重，显著提升召回率
+# 示例: "如何部署 K8s" → "K8s 集群搭建步骤" + "容器编排平台部署" + "Kubernetes 安装教程"
+[multi_query]
+enabled = true                  # 测试通过
+base_url = "${MULTI_QUERY_BASE_URL}"
+api_key = "${MULTI_QUERY_API_KEY}"
+model = "${MULTI_QUERY_MODEL}"
+num_variants = 3
+timeout = "30s"
+
+# 上下文压缩 — Context Compression
+# 检索返回的 chunk 可能包含大量与查询无关内容，压缩后只保留相关片段，减少 LLM token 消耗
+# 类型: embedding — 句子级 Embedding 相似度过滤（无 LLM 依赖，速度快）
+#       llm     — LLM 提取关键信息（质量最高，但有额外 LLM 调用开销）
+[context_compressor]
+enabled = true                  # 测试中
+type = "llm"                    # embedding / llm
+# 以下仅 type = "llm" 时需要配置:
+base_url = "${COMPRESSOR_BASE_URL}"
+api_key = "${COMPRESSOR_API_KEY}"
+model = "${COMPRESSOR_MODEL}"
+timeout = "15s"
+# 以下仅 type = "embedding" 时生效:
+similarity_top_n = 5             # 每个 chunk 保留前 N 个最相关句子
+min_similarity = 0.3             # 最低相似度阈值，低于则丢弃
+
+# Graph RAG — 知识图谱增强的 RAG
+# 从文档中提取实体和关系，构建知识图谱，支持多跳推理和关系查询
+# 图存储后端: memory (内存，重启丢失) / neo4j (持久化，生产推荐)
+# 实体提取器: simple (正则规则，零开销) / llm (LLM 提取，高准确率)
+[graph_rag]
+enabled = true                  # 启用后暴露 rag_graph_search 工具
+graph_store_type = "neo4j"        # memory / neo4j
+entity_extractor = "llm"         # simple / llm
+auto_extract = true             # 索引时自动提取实体
+search_depth = 2                 # 图搜索深度（1-3，超过 3 器噪声过大）
+merge_with_vector = true         # 图结果与向量检索结果融合
+
+# Neo4j 配置（仅 graph_store_type = "neo4j" 时生效）
+# 容器内网络使用服务名 "neo4j";宿主机本地开发改为 bolt://localhost:7687
+[graph_rag.neo4j]
+uri = "bolt://neo4j:7687"
+username = "neo4j"
+password = "${GRAPH_NEO4J_PASSWORD}"    # 通过环境变量注入
+database = "neo4j"
+max_conn_pool = 50
+connect_timeout = "10s"
+
+# LLM 实体提取器配置（仅 entity_extractor = "llm" 时生效）
+[graph_rag.llm_extractor]
+base_url = "${GRAPH_LLM_BASE_URL}"
+api_key = "${GRAPH_LLM_API_KEY}"
+model = "${GRAPH_LLM_MODEL}"
+max_tokens = 2048
+temperature = 0.3                # 适度温度保证实体+关系都能提取
+timeout = "30s"
+
 # Embedding Providers（可配置多个，支持故障转移）
 
 [[embedding_providers]]
 name = "primary-dashscope"
 type = "openai"
-base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-api_key = "${DASHSCOPE_API_KEY}"
-model = "text-embedding-v4"
+base_url = "${EMBEDDING_PRIMARY_BASE_URL}"
+api_key = "${EMBEDDING_PRIMARY_API_KEY}"
+model = "${EMBEDDING_PRIMARY_MODEL}"
 dimension = 1024
 priority = 1
 weight = 100
@@ -137,9 +245,9 @@ enabled = true
 [[embedding_providers]]
 name = "fallback-openai"
 type = "openai"
-base_url = "https://api.openai.com/v1"
-api_key = "${OPENAI_API_KEY}"
-model = "text-embedding-3-small"
+base_url = "${EMBEDDING_FALLBACK_BASE_URL}"
+api_key = "${EMBEDDING_FALLBACK_API_KEY}"
+model = "${EMBEDDING_FALLBACK_MODEL}"
 dimension = 1536
 priority = 2
 weight = 50

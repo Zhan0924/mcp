@@ -24,9 +24,11 @@
 package rag
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/google/uuid"
@@ -66,6 +68,7 @@ type TaskQueueConfig struct {
 	WorkerCount  int           `toml:"worker_count"`
 	TaskTTL      time.Duration `toml:"task_ttl"`
 	ClaimTimeout time.Duration `toml:"claim_timeout"`
+	WebhookURL   string        `toml:"webhook_url"` // 任务完成/失败后的回调 URL（可选）
 }
 
 // DefaultTaskQueueConfig 默认配置
@@ -89,6 +92,7 @@ type TaskQueue struct {
 	statusPrefix string
 	taskTTL      time.Duration
 	claimTimeout time.Duration
+	webhookURL   string // Webhook 回调 URL
 }
 
 // NewTaskQueue 创建任务队列
@@ -120,6 +124,7 @@ func NewTaskQueue(redis redisCli.UniversalClient, cfg TaskQueueConfig) *TaskQueu
 		statusPrefix: statusPrefix,
 		taskTTL:      taskTTL,
 		claimTimeout: claimTimeout,
+		webhookURL:   cfg.WebhookURL,
 	}
 }
 
@@ -332,4 +337,46 @@ func searchSubstring(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// --- Webhook 回调通知 ---
+
+// NotifyWebhook 在任务完成或失败时发送 Webhook 回调通知
+// 采用 fire-and-forget 策略：回调失败不影响任务状态，仅记录日志
+func (q *TaskQueue) NotifyWebhook(task *IndexTask) {
+	if q.webhookURL == "" {
+		return
+	}
+
+	go func() {
+		payload, err := json.Marshal(map[string]interface{}{
+			"event":     "task_" + task.Status,
+			"task_id":   task.TaskID,
+			"file_id":   task.FileID,
+			"file_name": task.FileName,
+			"user_id":   task.UserID,
+			"status":    task.Status,
+			"error":     task.Error,
+			"result":    task.Result,
+			"timestamp": time.Now().UTC(),
+		})
+		if err != nil {
+			logrus.Warnf("[TaskQueue] Webhook payload marshal failed: %v", err)
+			return
+		}
+
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Post(q.webhookURL, "application/json", bytes.NewReader(payload))
+		if err != nil {
+			logrus.Warnf("[TaskQueue] Webhook call failed for task %s: %v", task.TaskID, err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 400 {
+			logrus.Warnf("[TaskQueue] Webhook returned HTTP %d for task %s", resp.StatusCode, task.TaskID)
+		} else {
+			logrus.Infof("[TaskQueue] Webhook notified for task %s (status=%s)", task.TaskID, task.Status)
+		}
+	}()
 }

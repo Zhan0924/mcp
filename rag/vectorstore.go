@@ -1,76 +1,78 @@
 /*
 ================================================================================
-  文件: vectorstore.go
-  模块: rag
-  职责: 向量数据库抽象层 —— 封装向量索引管理、写入、搜索、混合检索、删除等核心操作
 
-  ┌─────────────────────────────────────────────────────────────────────────────┐
-  │                         整体架构                                           │
-  │                                                                             │
-  │  调用层 (tools/rag_tools.go)                                                │
-  │       │                                                                     │
-  │       ▼                                                                     │
-  │  ┌──────────────┐    接口抽象层                                             │
-  │  │ VectorStore  │◄── 面向接口编程，解耦具体实现                              │
-  │  │  (interface) │    可替换为 Milvus / Pinecone / Qdrant / Weaviate 等      │
-  │  └──────┬───────┘                                                           │
-  │         │ 实现                                                              │
-  │         ▼                                                                   │
-  │  ┌──────────────────┐                                                       │
-  │  │ RedisVectorStore │◄── 基于 Redis Stack (RediSearch + RedisJSON) 实现     │
-  │  │   (struct)       │    使用 FT.CREATE / FT.SEARCH / Pipeline 等命令       │
-  │  └──────────────────┘                                                       │
-  └─────────────────────────────────────────────────────────────────────────────┘
+	文件: vectorstore.go
+	模块: rag
+	职责: 向量数据库抽象层 —— 封装向量索引管理、写入、搜索、混合检索、删除等核心操作
 
-  ═══════════════════════════════════════════════════════════════════════════════
-  接口 (Interfaces):
-  ═══════════════════════════════════════════════════════════════════════════════
-    VectorStore           — 向量数据库统一抽象接口
-      ├── EnsureIndex()   — 幂等创建索引（FLAT / HNSW 算法）
-      ├── UpsertVectors() — Pipeline 批量写入向量数据
-      ├── SearchVectors() — KNN 向量近邻搜索（FT.SEARCH）
-      ├── HybridSearch()  — 混合搜索（向量 + BM25 全文 → RRF 融合）
-      ├── DeleteByFileID()— 按文件 ID 批量删除
-      └── Close()         — 关闭连接
+	┌─────────────────────────────────────────────────────────────────────────────┐
+	│                         整体架构                                           │
+	│                                                                             │
+	│  调用层 (tools/rag_tools.go)                                                │
+	│       │                                                                     │
+	│       ▼                                                                     │
+	│  ┌──────────────┐    接口抽象层                                             │
+	│  │ VectorStore  │◄── 面向接口编程，解耦具体实现                              │
+	│  │  (interface) │    可替换为 Milvus / Pinecone / Qdrant / Weaviate 等      │
+	│  └──────┬───────┘                                                           │
+	│         │ 实现                                                              │
+	│         ▼                                                                   │
+	│  ┌──────────────────┐                                                       │
+	│  │ RedisVectorStore │◄── 基于 Redis Stack (RediSearch + RedisJSON) 实现     │
+	│  │   (struct)       │    使用 FT.CREATE / FT.SEARCH / Pipeline 等命令       │
+	│  └──────────────────┘                                                       │
+	└─────────────────────────────────────────────────────────────────────────────┘
 
-  ═══════════════════════════════════════════════════════════════════════════════
-  类型 (Types):
-  ═══════════════════════════════════════════════════════════════════════════════
-    IndexConfig           — 索引创建配置（名称、前缀、维度、算法、HNSW 参数）
-    IndexAlgorithm        — 索引算法枚举（FLAT / HNSW）
-    HNSWParams            — HNSW 算法超参数（M, EF_CONSTRUCTION, EF_RUNTIME）
-    VectorEntry           — 待写入的向量条目（Key + Fields）
-    VectorQuery           — 向量搜索请求参数
-    HybridQuery           — 混合搜索请求参数（组合 VectorQuery + 全文条件）
-    VectorSearchResult    — 搜索结果（Key + Fields + Score）
-    RedisVectorStore      — VectorStore 的 Redis 实现
+	═══════════════════════════════════════════════════════════════════════════════
+	接口 (Interfaces):
+	═══════════════════════════════════════════════════════════════════════════════
+	  VectorStore           — 向量数据库统一抽象接口
+	    ├── EnsureIndex()   — 幂等创建索引（FLAT / HNSW 算法）
+	    ├── UpsertVectors() — Pipeline 批量写入向量数据
+	    ├── SearchVectors() — KNN 向量近邻搜索（FT.SEARCH）
+	    ├── HybridSearch()  — 混合搜索（向量 + BM25 全文 → RRF 融合）
+	    ├── DeleteByFileID()— 按文件 ID 批量删除
+	    └── Close()         — 关闭连接
 
-  ═══════════════════════════════════════════════════════════════════════════════
-  常量 (Constants):
-  ═══════════════════════════════════════════════════════════════════════════════
-    IndexAlgorithmFLAT    — "FLAT" 暴力搜索算法
-    IndexAlgorithmHNSW    — "HNSW" 近似最近邻算法
+	═══════════════════════════════════════════════════════════════════════════════
+	类型 (Types):
+	═══════════════════════════════════════════════════════════════════════════════
+	  IndexConfig           — 索引创建配置（名称、前缀、维度、算法、HNSW 参数）
+	  IndexAlgorithm        — 索引算法枚举（FLAT / HNSW）
+	  HNSWParams            — HNSW 算法超参数（M, EF_CONSTRUCTION, EF_RUNTIME）
+	  VectorEntry           — 待写入的向量条目（Key + Fields）
+	  VectorQuery           — 向量搜索请求参数
+	  HybridQuery           — 混合搜索请求参数（组合 VectorQuery + 全文条件）
+	  VectorSearchResult    — 搜索结果（Key + Fields + Score）
+	  RedisVectorStore      — VectorStore 的 Redis 实现
 
-  ═══════════════════════════════════════════════════════════════════════════════
-  函数 / 方法 (Functions / Methods):
-  ═══════════════════════════════════════════════════════════════════════════════
-    DefaultHNSWParams()                — 返回 HNSW 默认超参数
-    NewRedisVectorStore(client)        — 构造 RedisVectorStore 实例
+	═══════════════════════════════════════════════════════════════════════════════
+	常量 (Constants):
+	═══════════════════════════════════════════════════════════════════════════════
+	  IndexAlgorithmFLAT    — "FLAT" 暴力搜索算法
+	  IndexAlgorithmHNSW    — "HNSW" 近似最近邻算法
 
-    (RedisVectorStore) EnsureIndex()   — 幂等创建 Redis 向量索引
-    (RedisVectorStore) UpsertVectors() — Pipeline 批量写入
-    (RedisVectorStore) SearchVectors() — KNN 向量搜索
-    (RedisVectorStore) HybridSearch()  — 混合检索（向量 + 全文 + RRF）
-    (RedisVectorStore) DeleteByFileID()— 按 file_id 标签删除文档向量
-    (RedisVectorStore) Close()         — 关闭（当前为空操作）
+	═══════════════════════════════════════════════════════════════════════════════
+	函数 / 方法 (Functions / Methods):
+	═══════════════════════════════════════════════════════════════════════════════
+	  DefaultHNSWParams()                — 返回 HNSW 默认超参数
+	  NewRedisVectorStore(client)        — 构造 RedisVectorStore 实例
 
-    mergeByRRF()                       — RRF (Reciprocal Rank Fusion) 排名融合
-    parseRawSearchResult()             — 解析 FT.SEARCH 返回值（RESP2 / RESP3）
-    parseRawRESP3()                    — 解析 RESP3 格式的搜索结果
-    extractKeysFromSearch()            — 从搜索结果中提取文档 Key 列表
-    extractKeysFromRESP3()             — 从 RESP3 搜索结果中提取 Key 列表
-    escapeRedisQuery()                 — 转义 Redis 查询中的特殊字符
-    Float32SliceToBytes()              — float32 切片转 Little-Endian 字节序列
+	  (RedisVectorStore) EnsureIndex()   — 幂等创建 Redis 向量索引
+	  (RedisVectorStore) UpsertVectors() — Pipeline 批量写入
+	  (RedisVectorStore) SearchVectors() — KNN 向量搜索
+	  (RedisVectorStore) HybridSearch()  — 混合检索（向量 + 全文 + RRF）
+	  (RedisVectorStore) DeleteByFileID()— 按 file_id 标签删除文档向量
+	  (RedisVectorStore) Close()         — 关闭（当前为空操作）
+
+	  mergeByRRF()                       — RRF (Reciprocal Rank Fusion) 排名融合
+	  parseRawSearchResult()             — 解析 FT.SEARCH 返回值（RESP2 / RESP3）
+	  parseRawRESP3()                    — 解析 RESP3 格式的搜索结果
+	  extractKeysFromSearch()            — 从搜索结果中提取文档 Key 列表
+	  extractKeysFromRESP3()             — 从 RESP3 搜索结果中提取 Key 列表
+	  escapeRedisQuery()                 — 转义 Redis 查询中的特殊字符
+	  Float32SliceToBytes()              — float32 切片转 Little-Endian 字节序列
+
 ================================================================================
 */
 package rag
@@ -113,8 +115,22 @@ type VectorStore interface {
 	// DeleteByFileID 按 file_id 删除文档向量
 	DeleteByFileID(ctx context.Context, indexName, prefix, fileID string) (int64, error)
 
+	// GetDocumentChunks 按 file_id 获取文档的所有分块内容，按块序号排序
+	GetDocumentChunks(ctx context.Context, indexName, prefix, fileID string) ([]string, error)
+
+	// ListDocuments 列出指定索引中所有唯一的文档元信息
+	// 通过 FT.AGGREGATE 对 file_id 做去重聚合，返回每个文件的 ID、名称和 chunk 数量
+	ListDocuments(ctx context.Context, indexName string) ([]DocumentMeta, error)
+
 	// Close 关闭连接
 	Close() error
+}
+
+// DocumentMeta 文档元信息（用于 resources/list）
+type DocumentMeta struct {
+	FileID     string `json:"file_id"`
+	FileName   string `json:"file_name"`
+	ChunkCount int    `json:"chunk_count"`
 }
 
 // IndexConfig 索引创建配置
@@ -201,11 +217,11 @@ type VectorQuery struct {
 // 【设计思路】组合向量语义搜索与 BM25 全文关键词搜索，通过 RRF 融合排序。
 // 这样可以同时利用语义相似性（向量）和精确关键词匹配（BM25）的优势。
 type HybridQuery struct {
-	VectorQuery               // 嵌入向量搜索参数
-	TextQuery     string      // 全文搜索关键词（为空时退化为纯向量搜索）
-	TextFields    []string    // 全文搜索目标字段
-	VectorWeight  float64     // 向量搜索权重（默认 0.7）
-	KeywordWeight float64     // 关键词搜索权重（默认 0.3）
+	VectorQuery            // 嵌入向量搜索参数
+	TextQuery     string   // 全文搜索关键词（为空时退化为纯向量搜索）
+	TextFields    []string // 全文搜索目标字段
+	VectorWeight  float64  // 向量搜索权重（默认 0.7）
+	KeywordWeight float64  // 关键词搜索权重（默认 0.3）
 }
 
 // VectorSearchResult 向量搜索结果（底层通用结构）
@@ -285,6 +301,7 @@ func (s *RedisVectorStore) EnsureIndex(ctx context.Context, config IndexConfig) 
 		"file_name", "TEXT", "NOINDEX",
 		"chunk_id", "TAG",
 		"chunk_index", "NUMERIC",
+		"parent_chunk_id", "TAG",
 	}
 
 	switch algorithm {
@@ -398,13 +415,15 @@ func (s *RedisVectorStore) UpsertVectors(ctx context.Context, entries []VectorEn
 //
 // 【FT.SEARCH KNN 查询语法】
 // 格式: FT.SEARCH {index} "{filter}=>[KNN {K} @{field} $vec AS distance]"
-//       PARAMS 2 vec {blob} RETURN {n} {fields...} SORTBY distance ASC DIALECT 2
+//
+//	PARAMS 2 vec {blob} RETURN {n} {fields...} SORTBY distance ASC DIALECT 2
 //
 // 【Dialect 2 说明】
 // Redis Search 的方言版本：
 //   - Dialect 1: 旧版语法，不支持向量搜索
 //   - Dialect 2: 支持 KNN 向量查询语法（"=>[KNN ...]"）和 VECTOR 类型
 //   - Dialect 3: 支持更多高级功能（如 Aggregation Pipeline 中的向量操作）
+//
 // 本系统要求至少 Dialect 2。
 //
 // 【COSINE 距离解读】
@@ -555,45 +574,183 @@ func (s *RedisVectorStore) DeleteByFileID(ctx context.Context, indexName, prefix
 	escapedID := escapeTagValue(fileID)
 	searchQuery := fmt.Sprintf("@file_id:{%s}", escapedID)
 
-	// RETURN 0: 不返回任何字段，只要 Key（节省带宽）
-	// LIMIT 0 10000: 最多返回 10000 个匹配项
+	var totalDeleted int64
+	const batchSize = 1000
+
+	// 分页循环删除：每次查 batchSize 条 → Pipeline DEL → 直到无剩余
+	// 解决旧版硬编码 10000 上限的问题，支持超大文档
+	for {
+		result, err := s.client.Do(ctx, "FT.SEARCH", indexName, searchQuery,
+			"RETURN", "0", "LIMIT", "0", fmt.Sprintf("%d", batchSize)).Result()
+		if err != nil {
+			if strings.Contains(err.Error(), "Unknown index name") {
+				return totalDeleted, nil
+			}
+			return totalDeleted, NewRAGError(ErrCodeSearchFailed, "delete scan for "+fileID, err)
+		}
+
+		keys := extractKeysFromSearch(result)
+		if len(keys) == 0 {
+			break // 无更多匹配项，删除完成
+		}
+
+		// Pipeline 批量删除
+		pipe := s.client.Pipeline()
+		for _, key := range keys {
+			pipe.Del(ctx, key)
+		}
+		cmds, err := pipe.Exec(ctx)
+		if err != nil {
+			logrus.Warnf("[VectorStore] Partial delete error: %v", err)
+		}
+
+		for _, cmd := range cmds {
+			if cmd.Err() == nil {
+				totalDeleted++
+			}
+		}
+
+		// 如果这批数量小于 batchSize，说明已是最后一批
+		if len(keys) < batchSize {
+			break
+		}
+	}
+
+	return totalDeleted, nil
+}
+
+// GetDocumentChunks 按 file_id 获取文档的所有分块内容，按 chunk_index 升序排列
+func (s *RedisVectorStore) GetDocumentChunks(ctx context.Context, indexName, prefix, fileID string) ([]string, error) {
+	escapedID := escapeTagValue(fileID)
+	searchQuery := fmt.Sprintf("@file_id:{%s}", escapedID)
+
+	// SORTBY chunk_index ASC 保证分块顺序与原文一致
+	// LIMIT 0 10000 假设一个文件最多 10000 块
 	result, err := s.client.Do(ctx, "FT.SEARCH", indexName, searchQuery,
-		"RETURN", "0", "LIMIT", "0", "10000").Result()
+		"RETURN", "1", "content", "SORTBY", "chunk_index", "ASC", "LIMIT", "0", "10000").Result()
 	if err != nil {
 		if strings.Contains(err.Error(), "Unknown index name") {
-			return 0, nil
+			return nil, nil
 		}
-		return 0, NewRAGError(ErrCodeSearchFailed, "delete scan for "+fileID, err)
+		return nil, NewRAGError(ErrCodeSearchFailed, "get chunks for "+fileID, err)
 	}
 
-	keys := extractKeysFromSearch(result)
-	if len(keys) == 0 {
-		return 0, nil
-	}
-
-	// Pipeline 批量删除，减少 RTT
-	pipe := s.client.Pipeline()
-	for _, key := range keys {
-		pipe.Del(ctx, key)
-	}
-	cmds, err := pipe.Exec(ctx)
+	searchResults, err := parseRawSearchResult(result)
 	if err != nil {
-		logrus.Warnf("[VectorStore] Partial delete error: %v", err)
+		return nil, err
 	}
 
-	var deleted int64
-	for _, cmd := range cmds {
-		if cmd.Err() == nil {
-			deleted++
+	chunks := make([]string, 0, len(searchResults))
+	for _, res := range searchResults {
+		if content, ok := res.Fields["content"]; ok {
+			chunks = append(chunks, content)
 		}
 	}
-	return deleted, nil
+	return chunks, nil
 }
 
 // Close 关闭向量存储连接
 // 当前 Redis 连接生命周期由外部管理，此处为空操作
 func (s *RedisVectorStore) Close() error {
 	return nil
+}
+
+// ListDocuments 列出指定索引中所有唯一的文档元信息
+// 使用 FT.AGGREGATE GROUPBY 对 file_id + file_name 去重聚合，统计每个文件的 chunk 数量
+func (s *RedisVectorStore) ListDocuments(ctx context.Context, indexName string) ([]DocumentMeta, error) {
+	result, err := s.client.Do(ctx,
+		"FT.AGGREGATE", indexName, "*",
+		"GROUPBY", "2", "@file_id", "@file_name",
+		"REDUCE", "COUNT", "0", "AS", "chunk_count",
+	).Result()
+	if err != nil {
+		if strings.Contains(err.Error(), "Unknown index name") || strings.Contains(err.Error(), "No such index") {
+			return []DocumentMeta{}, nil
+		}
+		return nil, NewRAGError(ErrCodeSearchFailed, "list documents for "+indexName, err)
+	}
+
+	return parseAggregateResult(result)
+}
+
+// parseAggregateResult 解析 FT.AGGREGATE 返回值（RESP2 / RESP3 兼容）
+func parseAggregateResult(result interface{}) ([]DocumentMeta, error) {
+	// RESP3 format
+	if mapResult, ok := result.(map[interface{}]interface{}); ok {
+		return parseAggregateRESP3(mapResult)
+	}
+
+	// RESP2 format: [total, [field1, val1, field2, val2, ...], ...]
+	arr, ok := result.([]interface{})
+	if !ok || len(arr) < 2 {
+		return []DocumentMeta{}, nil
+	}
+
+	var docs []DocumentMeta
+	for i := 1; i < len(arr); i++ {
+		row, ok := arr[i].([]interface{})
+		if !ok {
+			continue
+		}
+		doc := DocumentMeta{}
+		for j := 0; j < len(row)-1; j += 2 {
+			key, _ := row[j].(string)
+			val := fmt.Sprintf("%v", row[j+1])
+			switch key {
+			case "file_id":
+				doc.FileID = val
+			case "file_name":
+				doc.FileName = val
+			case "chunk_count":
+				fmt.Sscanf(val, "%d", &doc.ChunkCount)
+			}
+		}
+		if doc.FileID != "" {
+			docs = append(docs, doc)
+		}
+	}
+	return docs, nil
+}
+
+// parseAggregateRESP3 解析 RESP3 格式的 FT.AGGREGATE 结果
+func parseAggregateRESP3(mapResult map[interface{}]interface{}) ([]DocumentMeta, error) {
+	resultsData, ok := mapResult["results"]
+	if !ok {
+		return []DocumentMeta{}, nil
+	}
+	resultsArray, ok := resultsData.([]interface{})
+	if !ok {
+		return []DocumentMeta{}, nil
+	}
+
+	var docs []DocumentMeta
+	for _, item := range resultsArray {
+		docMap, ok := item.(map[interface{}]interface{})
+		if !ok {
+			continue
+		}
+		doc := DocumentMeta{}
+		if attrs, ok := docMap["extra_attributes"]; ok {
+			if attrsMap, ok := attrs.(map[interface{}]interface{}); ok {
+				for k, v := range attrsMap {
+					key, _ := k.(string)
+					val := fmt.Sprintf("%v", v)
+					switch key {
+					case "file_id":
+						doc.FileID = val
+					case "file_name":
+						doc.FileName = val
+					case "chunk_count":
+						fmt.Sscanf(val, "%d", &doc.ChunkCount)
+					}
+				}
+			}
+		}
+		if doc.FileID != "" {
+			docs = append(docs, doc)
+		}
+	}
+	return docs, nil
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -739,6 +896,7 @@ func mergeByRRF(vectorResults, textResults []VectorSearchResult, vectorWeight, k
 // Redis 客户端库可能返回两种格式:
 //   - RESP2 ([]interface{}): Redis 6.x 默认协议，数组形式
 //   - RESP3 (map[interface{}]interface{}): Redis 7.x 新协议，结构化 Map 形式
+//
 // 此函数通过类型断言自动分发到对应的解析函数。
 func parseRawSearchResult(result interface{}) ([]VectorSearchResult, error) {
 	// 优先检测 RESP3 格式（Redis 7.x）

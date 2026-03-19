@@ -56,29 +56,155 @@ func (t *BaseTool) Handler() func(ctx context.Context, request mcp.CallToolReque
 	return t.handler
 }
 
-// Registry 工具注册中心
-type Registry struct {
-	providers []ToolProvider
+// Prompt 定义 MCP Prompt 接口
+type Prompt interface {
+	Definition() mcp.Prompt
+	Handler() server.PromptHandlerFunc
 }
 
-// NewRegistry 创建工具注册中心
-func NewRegistry() *Registry {
-	return &Registry{
-		providers: make([]ToolProvider, 0),
+// PromptProvider 提示词提供者接口
+type PromptProvider interface {
+	GetPrompts() []Prompt
+}
+
+// BasePrompt 基础 Prompt 实现
+type BasePrompt struct {
+	definition mcp.Prompt
+	handler    server.PromptHandlerFunc
+}
+
+func NewBasePrompt(definition mcp.Prompt, handler server.PromptHandlerFunc) *BasePrompt {
+	return &BasePrompt{
+		definition: definition,
+		handler:    handler,
 	}
 }
 
-// RegisterProvider 注册工具提供者
-func (r *Registry) RegisterProvider(provider ToolProvider) {
-	r.providers = append(r.providers, provider)
+func (p *BasePrompt) Definition() mcp.Prompt {
+	return p.definition
 }
 
-// ApplyToServer 将所有注册的工具应用到 MCP 服务器
+func (p *BasePrompt) Handler() server.PromptHandlerFunc {
+	return p.handler
+}
+
+// Resource 定义 MCP Resource 接口
+type Resource interface {
+	Definition() mcp.Resource
+	Handler() server.ResourceHandlerFunc
+}
+
+// ResourceProvider 资源提供者接口
+type ResourceProvider interface {
+	GetResources() []Resource
+}
+
+// BaseResource 基础 Resource 实现
+type BaseResource struct {
+	definition mcp.Resource
+	handler    server.ResourceHandlerFunc
+}
+
+func NewBaseResource(definition mcp.Resource, handler server.ResourceHandlerFunc) *BaseResource {
+	return &BaseResource{
+		definition: definition,
+		handler:    handler,
+	}
+}
+
+func (r *BaseResource) Definition() mcp.Resource {
+	return r.definition
+}
+
+func (r *BaseResource) Handler() server.ResourceHandlerFunc {
+	return r.handler
+}
+
+// ResourceTemplate 定义 MCP ResourceTemplate 接口
+type ResourceTemplate interface {
+	Definition() mcp.ResourceTemplate
+	Handler() server.ResourceTemplateHandlerFunc
+}
+
+// ResourceTemplateProvider 资源模板提供者接口
+type ResourceTemplateProvider interface {
+	GetResourceTemplates() []ResourceTemplate
+}
+
+// BaseResourceTemplate 基础 ResourceTemplate 实现
+type BaseResourceTemplate struct {
+	definition mcp.ResourceTemplate
+	handler    server.ResourceTemplateHandlerFunc
+}
+
+func NewBaseResourceTemplate(definition mcp.ResourceTemplate, handler server.ResourceTemplateHandlerFunc) *BaseResourceTemplate {
+	return &BaseResourceTemplate{
+		definition: definition,
+		handler:    handler,
+	}
+}
+
+func (r *BaseResourceTemplate) Definition() mcp.ResourceTemplate {
+	return r.definition
+}
+
+func (r *BaseResourceTemplate) Handler() server.ResourceTemplateHandlerFunc {
+	return r.handler
+}
+
+// Registry 工具注册中心
+type Registry struct {
+	toolProviders             []ToolProvider
+	promptProviders           []PromptProvider
+	resourceProviders         []ResourceProvider
+	resourceTemplateProviders []ResourceTemplateProvider
+}
+
+func NewRegistry() *Registry {
+	return &Registry{
+		toolProviders:             make([]ToolProvider, 0),
+		promptProviders:           make([]PromptProvider, 0),
+		resourceProviders:         make([]ResourceProvider, 0),
+		resourceTemplateProviders: make([]ResourceTemplateProvider, 0),
+	}
+}
+
+// RegisterProvider 注册提供者 (支持 ToolProvider, PromptProvider, ResourceProvider, ResourceTemplateProvider)
+func (r *Registry) RegisterProvider(provider any) {
+	if p, ok := provider.(ToolProvider); ok {
+		r.toolProviders = append(r.toolProviders, p)
+	}
+	if p, ok := provider.(PromptProvider); ok {
+		r.promptProviders = append(r.promptProviders, p)
+	}
+	if p, ok := provider.(ResourceProvider); ok {
+		r.resourceProviders = append(r.resourceProviders, p)
+	}
+	if p, ok := provider.(ResourceTemplateProvider); ok {
+		r.resourceTemplateProviders = append(r.resourceTemplateProviders, p)
+	}
+}
+
+// ApplyToServer 将所有注册的工具、资源和提示词应用到 MCP 服务器
 func (r *Registry) ApplyToServer(mcpServer *server.MCPServer) {
-	// 统一注册入口，避免在 main/server 中散落 AddTool 调用
-	for _, provider := range r.providers {
+	for _, provider := range r.toolProviders {
 		for _, tool := range provider.GetTools() {
 			mcpServer.AddTool(tool.Definition(), tool.Handler())
+		}
+	}
+	for _, provider := range r.promptProviders {
+		for _, prompt := range provider.GetPrompts() {
+			mcpServer.AddPrompt(prompt.Definition(), prompt.Handler())
+		}
+	}
+	for _, provider := range r.resourceProviders {
+		for _, resource := range provider.GetResources() {
+			mcpServer.AddResource(resource.Definition(), resource.Handler())
+		}
+	}
+	for _, provider := range r.resourceTemplateProviders {
+		for _, template := range provider.GetResourceTemplates() {
+			mcpServer.AddResourceTemplate(template.Definition(), template.Handler())
 		}
 	}
 }

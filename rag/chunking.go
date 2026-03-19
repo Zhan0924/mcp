@@ -38,12 +38,14 @@ import (
 
 // Chunk 文档分块结构
 type Chunk struct {
-	ChunkID    string // UUID v4，多租户环境下保证全局唯一
-	Content    string // 分块内容（可能包含与前一块的重叠区域）
-	ChunkIndex int    // 分块序号（从0开始）
-	StartPos   int    // 在原文中的起始位置（字符偏移）
-	EndPos     int    // 在原文中的结束位置（字符偏移）
-	TokenCount int    // Token 近似数量，用于下游 embedding 截断预判
+	ChunkID          string // UUID v4，多租户环境下保证全局唯一
+	ParentChunkID    string // UUID v4，仅在 ParentChildEnabled 时有值
+	Content          string // 分块内容（存入DB的真实数据）
+	EmbeddingContent string // 用于计算向量的内容（仅在 Parent-Child 模式下，等于子块内容）
+	ChunkIndex       int    // 分块序号（从0开始）
+	StartPos         int    // 在原文中的起始位置（字符偏移）
+	EndPos           int    // 在原文中的结束位置（字符偏移）
+	TokenCount       int    // Token 近似数量，用于下游 embedding 截断预判
 }
 
 // defaultSeparators 分隔符优先级列表（从粗粒度到细粒度）
@@ -79,6 +81,10 @@ func ChunkDocument(content string, config ChunkingConfig) []Chunk {
 	}
 	if config.OverlapSize <= 0 {
 		config.OverlapSize = 200
+	}
+
+	if config.ParentChildEnabled {
+		return parentChildChunking(content, config)
 	}
 
 	// 短文本直接返回单块，避免不必要的分割开销
@@ -154,6 +160,46 @@ func ChunkDocument(content string, config ChunkingConfig) []Chunk {
 	}
 
 	return chunks
+}
+
+// parentChildChunking 实现父子块分片策略
+// 1. 根据 ParentChunkSize 进行大块切割（保留上下文）
+// 2. 对每个父块再根据 ChildChunkSize 切割为小块
+// 3. 将小块的 Content 设为父块的 Content，这样向量化针对子块（粒度细），但取出的文本是父块（上下文全）
+func parentChildChunking(content string, config ChunkingConfig) []Chunk {
+	parentConfig := config
+	parentConfig.MaxChunkSize = config.ParentChunkSize
+	parentConfig.MinChunkSize = config.ParentChunkSize / 5
+	parentConfig.OverlapSize = config.ParentChunkSize / 5
+	parentConfig.ParentChildEnabled = false // 防止无限递归
+
+	parentChunks := ChunkDocument(content, parentConfig)
+
+	childConfig := config
+	childConfig.MaxChunkSize = config.ChildChunkSize
+	childConfig.MinChunkSize = config.ChildChunkSize / 5
+	childConfig.OverlapSize = config.ChildChunkSize / 5
+	childConfig.ParentChildEnabled = false
+
+	var finalChunks []Chunk
+	childIdx := 0
+
+	for _, pChunk := range parentChunks {
+		children := ChunkDocument(pChunk.Content, childConfig)
+		for _, cChunk := range children {
+			// CRITICAL: 对于每个子块，它的 Embedding 计算文本是自己的短小内容，
+			// 但我们希望最终存入 Redis 并通过 VectorSearch 返回的文本是父块的完整内容。
+			cChunk.ParentChunkID = pChunk.ChunkID
+			cChunk.ChunkIndex = childIdx
+			cChunk.EmbeddingContent = cChunk.Content
+			cChunk.Content = pChunk.Content
+
+			finalChunks = append(finalChunks, cChunk)
+			childIdx++
+		}
+	}
+
+	return finalChunks
 }
 
 // splitText 递归字符分割：按分隔符优先级从粗到细逐级尝试

@@ -262,18 +262,26 @@ type lruCache struct {
 	items    map[string]*list.Element // key → 链表节点，O(1) 定位
 	eviction *list.List               // 淘汰顺序链表，Front=最近使用, Back=最久未使用
 	mu       sync.Mutex
+	stopCh   chan struct{} // 后台清理协程停止信号
 }
 
 func newLRUCache(maxSize int, ttl time.Duration) *lruCache {
 	if maxSize <= 0 {
 		maxSize = 10000
 	}
-	return &lruCache{
+	c := &lruCache{
 		maxSize:  maxSize,
 		ttl:      ttl,
 		items:    make(map[string]*list.Element),
 		eviction: list.New(),
+		stopCh:   make(chan struct{}),
 	}
+	// 启动后台过期清理协程：每 5 分钟扫描一轮，清除过期但未被访问的条目
+	// 补充惰性过期的不足——长期不被 Get 的过期条目也能被释放
+	if ttl > 0 {
+		go c.backgroundCleanup()
+	}
+	return c
 }
 
 // Get 查找条目，命中后移到链表头部（标记为"最近使用"）
@@ -345,6 +353,66 @@ func (c *lruCache) Clear() {
 	defer c.mu.Unlock()
 	c.items = make(map[string]*list.Element)
 	c.eviction.Init()
+}
+
+// Stop 停止后台清理协程
+func (c *lruCache) Stop() {
+	select {
+	case <-c.stopCh:
+		// 已经停止
+	default:
+		close(c.stopCh)
+	}
+}
+
+// backgroundCleanup 后台过期清理协程
+// 每 5 分钟从链表尾部开始扫描（尾部是最久未访问的条目，最可能已过期），
+// 一次最多清理 1000 个过期条目，避免长时间持锁阻塞热路径
+func (c *lruCache) backgroundCleanup() {
+	cleanupInterval := 5 * time.Minute
+	if c.ttl < cleanupInterval {
+		cleanupInterval = c.ttl // TTL 较短时加快清理频率
+	}
+
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			c.cleanExpired(1000)
+		}
+	}
+}
+
+// cleanExpired 从链表尾部开始批量清除过期条目
+// maxClean 限制单次清理数量，防止长时间持锁
+func (c *lruCache) cleanExpired(maxClean int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	cleaned := 0
+
+	// 从尾部（最久未使用）开始扫描
+	for elem := c.eviction.Back(); elem != nil && cleaned < maxClean; {
+		entry := elem.Value.(*lruEntry)
+		prev := elem.Prev() // 先保存前驱，因为 Remove 会断开链接
+
+		if c.ttl > 0 && now.After(entry.expiresAt) {
+			delete(c.items, entry.key)
+			c.eviction.Remove(elem)
+			cleaned++
+		}
+
+		elem = prev
+	}
+
+	if cleaned > 0 {
+		logrus.Debugf("[LRUCache] Background cleanup: removed %d expired entries, remaining %d", cleaned, len(c.items))
+	}
 }
 
 // --- 全局缓存实例 ---

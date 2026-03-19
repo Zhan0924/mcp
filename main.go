@@ -84,6 +84,13 @@ func main() {
 	logrus.Infof("Embedding 缓存已初始化: local_cap=%d, redis=%v", cacheStats.LocalCap, cfg.Cache.RedisEnabled)
 
 	InitReranker(cfg)
+	InitCompressor(cfg)
+
+	// Graph RAG 子系统（可选）
+	graphStore, entityExtractor := InitGraphRAG(cfg)
+	if graphStore != nil {
+		defer graphStore.Close()
+	}
 
 	// 异步索引子系统（可选）：基于 Redis Streams 的分布式任务队列
 	// 原理：多实例部署时，每个实例启动独立的消费者组 Worker，
@@ -117,14 +124,14 @@ func main() {
 	}
 
 	logrus.Infof("正在启动 RAG MCP Server (Port: %d)...", cfg.Server.Port)
-	logrus.Infof("索引算法: %s | 混合检索: %v | 结构感知分块: %v | Rerank: %v | 异步索引: %v",
+	logrus.Infof("索引算法: %s | 混合检索: %v | 结构感知分块: %v | Rerank: %v | 异步索引: %v | Graph RAG: %v",
 		cfg.Retriever.IndexAlgorithm, cfg.Retriever.HybridSearchEnabled,
-		cfg.Chunking.StructureAware, cfg.Rerank.Enabled, asyncCfg.Enabled)
+		cfg.Chunking.StructureAware, cfg.Rerank.Enabled, asyncCfg.Enabled, cfg.GraphRAG.Enabled)
 
 	// 在独立 goroutine 中启动 HTTP 服务器，主 goroutine 用于信号监听
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- StartServer(cfg, redisClient, taskQueue)
+		errCh <- StartServerWithGraphRAG(cfg, redisClient, taskQueue, graphStore, entityExtractor)
 	}()
 
 	logrus.Info("----------------------------------------")

@@ -74,15 +74,29 @@ redis-cli -a 123456 MODULE LIST
 | DashScope | text-embedding-v4 | 1024 | [阿里云百炼](https://dashscope.console.aliyun.com/) |
 | OpenAI | text-embedding-3-small | 1536 | [OpenAI Platform](https://platform.openai.com/) |
 
-### 4. 环境变量（可选）
+### 4. 环境变量
 
-`config.toml` 中 `${VAR_NAME}` 语法的值会自动替换为环境变量：
+`config.toml` 中 `${VAR_NAME}` 语法的值会自动替换为环境变量。复制 `.env.example` 为 `.env` 并填写实际值：
 
 ```bash
-export REDIS_PASSWORD="your_redis_password"
-export DASHSCOPE_API_KEY="sk-xxx"
-export OPENAI_API_KEY="sk-xxx"
+cp .env.example .env
 ```
+
+各功能模块的环境变量分组如下（完整列表见 `.env.example`）：
+
+| 分组 | 环境变量 | 说明 |
+|------|----------|------|
+| Redis | `REDIS_PASSWORD` | Redis 密码 |
+| Embedding (主) | `EMBEDDING_PRIMARY_BASE_URL` / `_API_KEY` / `_MODEL` | 主 Embedding 服务 |
+| Embedding (备) | `EMBEDDING_FALLBACK_BASE_URL` / `_API_KEY` / `_MODEL` | 备用 Embedding 服务 |
+| Rerank | `RERANK_BASE_URL` / `_API_KEY` / `_MODEL` | 重排序服务 |
+| HyDE | `HYDE_BASE_URL` / `_API_KEY` / `_MODEL` | 查询扩展 |
+| Multi-Query | `MULTI_QUERY_BASE_URL` / `_API_KEY` / `_MODEL` | 多查询检索 |
+| Compressor | `COMPRESSOR_BASE_URL` / `_API_KEY` / `_MODEL` | 上下文压缩 |
+| Graph RAG | `GRAPH_NEO4J_PASSWORD` | Neo4j 密码 |
+| Graph RAG LLM | `GRAPH_LLM_BASE_URL` / `_API_KEY` / `_MODEL` | 实体提取器 |
+| Milvus | `MILVUS_TOKEN` | Milvus Cloud Token |
+| Qdrant | `QDRANT_API_KEY` | Qdrant Cloud API Key |
 
 ---
 
@@ -1010,7 +1024,7 @@ chmod +x test_all.sh
 2. **放置程序与配置**：将编译好的 `rag-mcp-server` 和 `config.toml` 放到服务器，按需修改：
    - `[server] port`：对外提供 MCP 的端口（默认 8082）。
    - `[redis] addr` / `addrs`：改为该机可访问的 Redis 地址（如 `redis-server:6379`）。
-   - Embedding/Rerank 的 `api_key` 或通过环境变量 `${DASHSCOPE_API_KEY}` 等注入。
+   - Embedding/Rerank 的 `api_key` 等敏感信息通过环境变量注入（见 `.env.example`）。
 3. **启动服务**：
    ```bash
    ./rag-mcp-server -config config.toml

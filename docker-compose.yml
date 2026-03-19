@@ -1,6 +1,28 @@
-version: '3.8'
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  RAG MCP Server — Docker Compose 编排                                    ║
+# ║                                                                         ║
+# ║  服务拓扑:                                                               ║
+# ║    mcp-rag-server ──→ redis-stack (向量存储/缓存/任务队列)               ║
+# ║                   ──→ neo4j       (知识图谱, 可选)                       ║
+# ║                                                                         ║
+# ║  启动命令:                                                               ║
+# ║    全部启动:   docker compose up -d                                      ║
+# ║    不含 Neo4j: docker compose up -d mcp-rag-server redis-stack           ║
+# ║    仅基础设施: docker compose up -d redis-stack neo4j                    ║
+# ║                                                                         ║
+# ║  环境变量 (.env 文件或 shell export):                                    ║
+# ║    详见 .env.example — 每个功能模块独立配置 base_url / api_key / model    ║
+# ║    REDIS_PASSWORD              — Redis 密码                               ║
+# ║    EMBEDDING_PRIMARY_API_KEY   — 主 Embedding 服务 API Key (必须)         ║
+# ║    RERANK_API_KEY              — Rerank 重排序 API Key                    ║
+# ║    GRAPH_NEO4J_PASSWORD        — Neo4j 密码 (默认 neo4j_rag_2024)        ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
 
 services:
+
+  # ═════════════════════════════════════════════════════════════════════════
+  #  RAG MCP Server — 核心应用
+  # ═════════════════════════════════════════════════════════════════════════
   mcp-rag-server:
     build:
       context: .
@@ -8,37 +30,132 @@ services:
     container_name: mcp-rag-server
     restart: unless-stopped
     ports:
-      - "8082:8083" # 修复：容器内部根据 config.toml 实际上是监听 8083 端口
+      - "8082:8083"             # 宿主机 8082 → 容器 8083 (config.toml port=8083)
     environment:
-      # 传入环境变量覆盖 API Key 等敏感配置 (根据 config.toml 中定义的 ${VAR_NAME} 替换逻辑)
+      # ---- Embedding Provider (主) ----
+      - EMBEDDING_PRIMARY_BASE_URL=${EMBEDDING_PRIMARY_BASE_URL:-}
+      - EMBEDDING_PRIMARY_API_KEY=${EMBEDDING_PRIMARY_API_KEY:-}
+      - EMBEDDING_PRIMARY_MODEL=${EMBEDDING_PRIMARY_MODEL:-text-embedding-v4}
+      # ---- Embedding Provider (备) ----
+      - EMBEDDING_FALLBACK_BASE_URL=${EMBEDDING_FALLBACK_BASE_URL:-}
+      - EMBEDDING_FALLBACK_API_KEY=${EMBEDDING_FALLBACK_API_KEY:-}
+      - EMBEDDING_FALLBACK_MODEL=${EMBEDDING_FALLBACK_MODEL:-text-embedding-3-small}
+      # ---- Rerank 重排序 ----
+      - RERANK_BASE_URL=${RERANK_BASE_URL:-}
+      - RERANK_API_KEY=${RERANK_API_KEY:-}
+      - RERANK_MODEL=${RERANK_MODEL:-qwen3-rerank}
+      # ---- HyDE 查询扩展 ----
+      - HYDE_BASE_URL=${HYDE_BASE_URL:-}
+      - HYDE_API_KEY=${HYDE_API_KEY:-}
+      - HYDE_MODEL=${HYDE_MODEL:-qwen-turbo}
+      # ---- Multi-Query 多查询检索 ----
+      - MULTI_QUERY_BASE_URL=${MULTI_QUERY_BASE_URL:-}
+      - MULTI_QUERY_API_KEY=${MULTI_QUERY_API_KEY:-}
+      - MULTI_QUERY_MODEL=${MULTI_QUERY_MODEL:-qwen-turbo}
+      # ---- Context Compressor 上下文压缩 ----
+      - COMPRESSOR_BASE_URL=${COMPRESSOR_BASE_URL:-}
+      - COMPRESSOR_API_KEY=${COMPRESSOR_API_KEY:-}
+      - COMPRESSOR_MODEL=${COMPRESSOR_MODEL:-qwen-turbo}
+      # ---- Graph RAG ----
+      - GRAPH_NEO4J_PASSWORD=${GRAPH_NEO4J_PASSWORD:-neo4j_rag_2024}
+      - GRAPH_LLM_BASE_URL=${GRAPH_LLM_BASE_URL:-}
+      - GRAPH_LLM_API_KEY=${GRAPH_LLM_API_KEY:-}
+      - GRAPH_LLM_MODEL=${GRAPH_LLM_MODEL:-qwen-turbo}
+      # ---- VectorStore (可选) ----
+      - MILVUS_TOKEN=${MILVUS_TOKEN:-}
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      # ---- 基础设施密码 ----
       - REDIS_PASSWORD=${REDIS_PASSWORD:-123456}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-}
     volumes:
-      - ./config.toml:/app/config.toml
+      - ./config.toml:/app/config.toml:ro
     depends_on:
-      - redis-stack
+      redis-stack:
+        condition: service_healthy
+      # Neo4j 依赖条件启动: 仅当 graph_rag.enabled=true 且 graph_store_type="neo4j" 时需要
+      # 如果不使用 Neo4j，可注释下面两行或使用 --no-deps 启动
+      neo4j:
+        condition: service_healthy
     networks:
       - rag-network
 
+  # ═════════════════════════════════════════════════════════════════════════
+  #  Redis Stack — 向量数据库 + 缓存 + 任务队列
+  #  包含 RediSearch (FT.CREATE/FT.SEARCH) 和 RedisJSON 模块
+  # ═════════════════════════════════════════════════════════════════════════
   redis-stack:
     image: redis/redis-stack:latest
     container_name: redis-stack
     restart: unless-stopped
     ports:
-      - "6380:6379" # 宿主机端口占用，将对外映射改为 6380 (容器内部依然是 6379)
-      - "8002:8001" # 宿主机 8001 端口也被占用，对外映射面板改用 8002
+      - "6380:6379"             # Redis 端口 (宿主机 6380 避免冲突)
+      - "8002:8001"             # RedisInsight 管理面板
     environment:
-      # 配置 redis 密码
       - REDIS_ARGS=--requirepass ${REDIS_PASSWORD:-123456}
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-123456}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - rag-network
+
+  # ═════════════════════════════════════════════════════════════════════════
+  #  Neo4j — 知识图谱数据库 (Graph RAG 后端)
+  #
+  #  用途: 存储从文档中提取的实体-关系三元组，支持多跳图谱检索
+  #  协议: Bolt (bolt://neo4j:7687) + HTTP (http://neo4j:7474)
+  #
+  #  首次启动会自动:
+  #    1. 设置密码为 GRAPH_NEO4J_PASSWORD 环境变量值
+  #    2. 接受社区版 License
+  #    3. 启用 APOC 插件 (高级过程和函数库)
+  #
+  #  管理面板: http://localhost:7474 (用户名 neo4j)
+  #
+  #  如不需要 Graph RAG 功能，可将 config.toml 中
+  #  graph_rag.enabled 设为 false，并注释掉此服务
+  # ═════════════════════════════════════════════════════════════════════════
+  neo4j:
+    image: neo4j:5-community
+    container_name: neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"             # HTTP API + Neo4j Browser 管理面板
+      - "7687:7687"             # Bolt 协议 (应用连接端口)
+    environment:
+      # ---- 认证配置 ----
+      - NEO4J_AUTH=neo4j/${GRAPH_NEO4J_PASSWORD:-neo4j_rag_2024}
+      # ---- 内存配置 (按服务器资源调整) ----
+      - NEO4J_server_memory_heap_initial__size=256m
+      - NEO4J_server_memory_heap_max__size=512m
+      - NEO4J_server_memory_pagecache_size=256m
+      # ---- 插件 ----
+      - NEO4J_PLUGINS=["apoc"]
+      # ---- 接受社区版 License ----
+      - NEO4J_ACCEPT_LICENSE_AGREEMENT=yes
+    volumes:
+      - neo4j_data:/data          # 数据持久化
+      - neo4j_logs:/logs          # 日志
+    healthcheck:
+      # 通过 Cypher 命令验证数据库完全就绪
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s           # Neo4j 冷启动需 20-40s
     networks:
       - rag-network
 
 volumes:
   redis_data:
     name: mcp_rag_redis_data
+  neo4j_data:
+    name: mcp_rag_neo4j_data
+  neo4j_logs:
+    name: mcp_rag_neo4j_logs
 
 networks:
   rag-network:

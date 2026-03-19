@@ -49,6 +49,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	embeddingArk "github.com/cloudwego/eino-ext/components/embedding/ark"
 	"github.com/cloudwego/eino/components/embedding"
@@ -59,14 +60,18 @@ import (
 // 每个实例绑定一个 userID，通过索引名模板 (如 mcp_rag_user_%d:idx) 实现多租户数据隔离，
 // 避免不同用户的文档在同一索引中互相污染。
 type MultiFileRetriever struct {
-	store      VectorStore        // 底层向量存储抽象（Redis / 其它实现）
-	embCfg     *EmbeddingConfig   // Embedding API 连接配置
-	retCfg     *RetrieverConfig   // 检索行为配置（TopK、权重、索引模板等）
-	chunkCfg   *ChunkingConfig    // 文档分块策略配置
-	embedding  embedding.Embedder // 直连 Embedder（无 Manager 时的降级方案）
-	useManager bool               // 是否使用全局 EmbeddingManager（带多 Provider 故障转移）
-	userID     uint               // 所属用户 ID，决定索引名和 Key 前缀
-	topK       int                // 当前检索返回数量上限
+	store            VectorStore          // 底层向量存储抽象（Redis / Milvus / Qdrant）
+	embCfg           *EmbeddingConfig     // Embedding API 连接配置
+	retCfg           *RetrieverConfig     // 检索行为配置（TopK、权重、索引模板等）
+	chunkCfg         *ChunkingConfig      // 文档分块策略配置
+	embedding        embedding.Embedder   // 直连 Embedder（无 Manager 时的降级方案）
+	useManager       bool                 // 是否使用全局 EmbeddingManager（带多 Provider 故障转移）
+	queryTransformer QueryTransformer     // 查询重写器（用于 HyDE 等查询拓展）
+	multiQuery       *MultiQueryRetriever // 多查询检索器（可选）
+	userID           uint                 // 所属用户 ID，决定索引名和 Key 前缀
+	collection       string               // 知识库集合名称，空字符串表示使用默认集合
+	topK             int                  // 当前检索返回数量上限
+	inMultiQuery     bool                 // 递归保护: 处于 MultiQuery 子查询时置 true，防止无限递归
 }
 
 // NewMultiFileRetriever 创建多文件检索器。
@@ -81,6 +86,16 @@ func NewMultiFileRetriever(ctx context.Context, store VectorStore, embCfg *Embed
 		chunkCfg: chunkCfg,
 		userID:   userID,
 		topK:     retCfg.DefaultTopK,
+	}
+
+	// 初始化查询拓展器 (如 HyDE)
+	if retCfg.HyDEEnabled && retCfg.HyDEConfig != nil {
+		r.queryTransformer = NewHyDETransformer(*retCfg.HyDEConfig)
+	}
+
+	// 初始化多查询检索器
+	if retCfg.MultiQueryEnabled && retCfg.MultiQueryConfig != nil {
+		r.multiQuery = NewMultiQueryRetriever(*retCfg.MultiQueryConfig)
 	}
 
 	// 优先检测全局 Manager 是否就绪（至少注册了一个 Provider）
@@ -122,6 +137,11 @@ func NewMultiFileRetriever(ctx context.Context, store VectorStore, embCfg *Embed
 
 	r.embedding = embedder
 	return r, nil
+}
+
+// SetCollection 设置知识库集合名称，用于实现同一用户下多个知识库的隔离
+func (r *MultiFileRetriever) SetCollection(collection string) {
+	r.collection = collection
 }
 
 // SetTopK 设置每次检索返回的最大结果数。
@@ -168,6 +188,55 @@ func (r *MultiFileRetriever) embedTexts(ctx context.Context, texts []string) ([]
 func (r *MultiFileRetriever) Retrieve(ctx context.Context, query string, fileIDs []string) ([]RetrievalResult, error) {
 	logrus.Infof("[RAG Query] Starting retrieval for user %d, query: %s, fileIDs: %v", r.userID, query, fileIDs)
 
+	originalQuery := query
+
+	// ── 超时预算检查: 各阶段开始前检查剩余时间，不足时跳过 LLM 密集阶段 ──
+	remainingTime := func() time.Duration {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			return 999 * time.Second // 无截止时间，不限制
+		}
+		return time.Until(deadline)
+	}
+
+	// 多查询检索: 生成查询变体，并发检索后 RRF 融合
+	// inMultiQuery 标志防止递归: MultiQueryRetrieve 会回调 Retrieve()，
+	// 若不加保护会无限递归（每个变体又触发 MultiQuery 生成新变体…）
+	if r.multiQuery != nil && r.retCfg.MultiQueryEnabled && !r.inMultiQuery {
+		if remaining := remainingTime(); remaining > 15*time.Second {
+			variants, err := r.multiQuery.GenerateQueryVariants(ctx, query)
+			if err == nil && len(variants) > 0 {
+				logrus.Infof("[RAG Query] Multi-query generated %d variants (budget remaining: %s)",
+					len(variants), remainingTime().Truncate(time.Second))
+				r.inMultiQuery = true
+				results, err := MultiQueryRetrieve(ctx, r, query, variants, fileIDs, r.topK)
+				r.inMultiQuery = false
+				if err == nil {
+					results = r.applyContextCompression(ctx, originalQuery, results)
+					return results, nil
+				}
+				logrus.Warnf("[RAG Query] Multi-query retrieval failed, falling back: %v", err)
+			}
+		} else {
+			logrus.Warnf("[RAG Query] Skipping multi-query: insufficient time budget (%s remaining)", remaining.Truncate(time.Second))
+		}
+	}
+
+	// 查询扩展与重写 (HyDE) — 检查超时预算
+	if r.retCfg.HyDEEnabled && r.queryTransformer != nil {
+		if remaining := remainingTime(); remaining > 10*time.Second {
+			extendedQuery, err := r.queryTransformer.Transform(ctx, query)
+			if err == nil && extendedQuery != "" {
+				logrus.Infof("[RAG Query] HyDE extended query snippet:\n%s", extendedQuery)
+				query = extendedQuery
+			} else if err != nil {
+				logrus.Warnf("[RAG Query] HyDE transformation failed, using original query: %v", err)
+			}
+		} else {
+			logrus.Warnf("[RAG Query] Skipping HyDE: insufficient time budget (%s remaining)", remaining.Truncate(time.Second))
+		}
+	}
+
 	vectors, err := r.embedTexts(ctx, []string{query})
 	if err != nil {
 		return nil, NewRAGError(ErrCodeEmbeddingFailed, "embed query", err)
@@ -180,8 +249,7 @@ func (r *MultiFileRetriever) Retrieve(ctx context.Context, query string, fileIDs
 	queryVector := vectors[0]
 	logrus.Infof("[RAG Query] Query vector dimension: %d", len(queryVector))
 
-	// 每个用户拥有独立索引名，确保多租户检索不会跨用户泄露数据
-	indexName := generateUserIndexName(r.retCfg.UserIndexNameTemplate, r.userID)
+	indexName := r.generateIndexName()
 
 	// float64 → float32 → []byte: RediSearch VECTOR 字段要求小端序 float32 二进制
 	queryVector32 := make([]float32, len(queryVector))
@@ -210,7 +278,7 @@ func (r *MultiFileRetriever) Retrieve(ctx context.Context, query string, fileIDs
 
 	returnFields := r.retCfg.ReturnFields
 	if len(returnFields) == 0 {
-		returnFields = []string{"content", "file_id", "file_name", "chunk_id", "chunk_index", "distance"}
+		returnFields = []string{"content", "file_id", "file_name", "chunk_id", "chunk_index", "parent_chunk_id", "distance"}
 	}
 
 	dialect := r.retCfg.SearchDialect
@@ -222,7 +290,12 @@ func (r *MultiFileRetriever) Retrieve(ctx context.Context, query string, fileIDs
 
 	// 混合检索（向量 + 关键词加权融合），适合语义与字面匹配都重要的场景
 	if r.retCfg.HybridSearchEnabled && query != "" {
-		return r.hybridRetrieve(ctx, query, vectorBytes, filterQuery, indexName, vectorField, returnFields, dialect, effectiveTopK)
+		results, err := r.hybridRetrieve(ctx, query, vectorBytes, filterQuery, indexName, vectorField, returnFields, dialect, effectiveTopK)
+		if err != nil {
+			return nil, err
+		}
+		results = r.applyContextCompression(ctx, originalQuery, results)
+		return results, nil
 	}
 
 	// 纯向量语义检索
@@ -242,9 +315,35 @@ func (r *MultiFileRetriever) Retrieve(ctx context.Context, query string, fileIDs
 	}
 
 	results := convertVectorResults(rawResults)
+	results = deduplicateByParent(results)
 	results = r.filterByMinScore(results)
 
+	// 上下文压缩
+	results = r.applyContextCompression(ctx, originalQuery, results)
+
 	return results, nil
+}
+
+// applyContextCompression 应用上下文压缩（如果启用）
+// 检查剩余超时预算: 不足 5s 时跳过压缩，直接返回原始结果
+func (r *MultiFileRetriever) applyContextCompression(ctx context.Context, query string, results []RetrievalResult) []RetrievalResult {
+	if !r.retCfg.CompressorEnabled || len(results) == 0 {
+		return results
+	}
+	// 超时预算检查: LLM 压缩需要充足时间
+	if deadline, ok := ctx.Deadline(); ok {
+		if time.Until(deadline) < 5*time.Second {
+			logrus.Warnf("[RAG Query] Skipping context compression: insufficient time budget (%s remaining)",
+				time.Until(deadline).Truncate(time.Second))
+			return results
+		}
+	}
+	compressed, err := CompressResults(ctx, query, results)
+	if err != nil {
+		logrus.Warnf("[RAG Query] Context compression failed, using original results: %v", err)
+		return results
+	}
+	return compressed
 }
 
 // hybridRetrieve 混合检索：向量相似度 + 关键词 BM25 加权融合。
@@ -255,7 +354,7 @@ func (r *MultiFileRetriever) hybridRetrieve(ctx context.Context, query string, v
 		VectorQuery: VectorQuery{
 			IndexName:       indexName,
 			Vector:          vectorBytes,
-			TopK:            topK * 3, // 过采样：融合排序需要更大候选池
+			TopK:            topK * r.getOversamplingMultiple(), // 过采样：融合排序需要更大候选池
 			VectorFieldName: vectorField,
 			ReturnFields:    returnFields,
 			SearchDialect:   dialect,
@@ -279,6 +378,7 @@ func (r *MultiFileRetriever) hybridRetrieve(ctx context.Context, query string, v
 	}
 
 	results := convertVectorResults(rawResults)
+	results = deduplicateByParent(results)
 
 	// 过采样后截断到用户实际请求的 TopK
 	if len(results) > topK {
@@ -340,6 +440,9 @@ func convertVectorResults(raw []VectorSearchResult) []RetrievalResult {
 		if v, ok := r.Fields["chunk_index"]; ok {
 			res.ChunkIndex, _ = strconv.Atoi(v)
 		}
+		if v, ok := r.Fields["parent_chunk_id"]; ok {
+			res.ParentChunkID = v
+		}
 
 		// 余弦距离 → 相关性分数: distance ∈ [0, 2]，score ∈ [0, 1]
 		if v, ok := r.Fields["distance"]; ok {
@@ -359,13 +462,37 @@ func convertVectorResults(raw []VectorSearchResult) []RetrievalResult {
 	return results
 }
 
+// deduplicateByParent 对 Parent-Child 模式的检索结果去重。
+// 多个子块可能命中同一个父块，此时只保留相关性最高的子块对应的父块内容，
+// 避免返回给 LLM 的上下文中出现大量重复的父块文本。
+func deduplicateByParent(results []RetrievalResult) []RetrievalResult {
+	seen := make(map[string]bool)
+	var deduped []RetrievalResult
+
+	for _, res := range results {
+		if res.ParentChunkID == "" {
+			// 非 Parent-Child 模式的结果直接保留
+			deduped = append(deduped, res)
+			continue
+		}
+
+		key := res.FileID + ":" + res.ParentChunkID
+		if !seen[key] {
+			seen[key] = true
+			deduped = append(deduped, res)
+		}
+	}
+
+	return deduped
+}
+
 // EnsureIndex 确保用户的 Redis 向量索引存在。
 // 采用惰性创建策略：仅在 IndexDocument 首次写入时调用，而非构造器中急切创建。
 // 这避免了为从未上传文档的用户浪费 Redis 资源（FT.CREATE 会占用内存和 CPU）。
 // vectorDim 从首批 Embedding 结果动态获取，无需配置中硬编码维度。
 func (r *MultiFileRetriever) EnsureIndex(ctx context.Context, vectorDim int) error {
-	indexName := generateUserIndexName(r.retCfg.UserIndexNameTemplate, r.userID)
-	prefix := generateUserIndexPrefix(r.retCfg.UserIndexPrefixTemplate, r.userID)
+	indexName := r.generateIndexName()
+	prefix := r.generatePrefix()
 
 	vectorField := r.retCfg.VectorFieldName
 	if vectorField == "" {
@@ -399,15 +526,46 @@ func (r *MultiFileRetriever) IndexDocument(ctx context.Context, fileID, fileName
 	logrus.Infof("[RAG Index] Indexing document: file_id=%s, file_name=%s, user=%d, content_len=%d",
 		fileID, fileName, r.userID, len(content))
 
+	// Upsert 语义：先删除旧的 chunk，再写入新的，避免重复索引同一文件时产生残留数据
+	indexName := r.generateIndexName()
+	prefix := r.generatePrefix()
+	existingDeleted, err := r.store.DeleteByFileID(ctx, indexName, prefix, fileID)
+	if err != nil {
+		// 删除失败不阻止索引，仅警告（索引可能尚不存在）
+		logrus.Warnf("[RAG Index] Pre-delete for file %s failed (may be first index): %v", fileID, err)
+	} else if existingDeleted > 0 {
+		logrus.Infof("[RAG Index] Upsert: deleted %d existing chunks for file %s", existingDeleted, fileID)
+	}
+
 	chunkCfg := DefaultChunkingConfig()
 	if r.chunkCfg != nil {
 		chunkCfg = r.chunkCfg
 	}
 
-	// 结构感知分块：对 Markdown 文档按标题层次切分，保留语义完整性；
-	// 其它格式或解析失败时回退到固定窗口 + 重叠的通用分块策略
+	// 智能分块策略选择: 代码感知 → 语义分块 → 结构感知 → 固定窗口
 	var chunks []Chunk
-	if chunkCfg.StructureAware {
+
+	// 1. 代码文件: 使用代码感知分块
+	if chunkCfg.CodeChunkingEnabled {
+		if lang := DetectCodeLanguage(content, fileName); lang != "" {
+			chunks = CodeChunking(content, lang, chunkCfg.MaxChunkSize)
+			logrus.Infof("[RAG Index] Used code-aware chunking (lang=%s, chunks=%d)", lang, len(chunks))
+		}
+	}
+
+	// 2. 语义分块: 基于 Embedding 相似度的动态分块
+	if len(chunks) == 0 && chunkCfg.SemanticChunking.Enabled {
+		embedFn := func(ctx context.Context, texts []string) ([][]float64, error) {
+			return r.embedTexts(ctx, texts)
+		}
+		chunks = SemanticChunking(ctx, content, chunkCfg.SemanticChunking, embedFn)
+		if len(chunks) > 0 {
+			logrus.Infof("[RAG Index] Used semantic chunking (chunks=%d)", len(chunks))
+		}
+	}
+
+	// 3. 结构感知分块: Markdown 文档按标题层次切分
+	if len(chunks) == 0 && chunkCfg.StructureAware {
 		doc, err := ParseDocument(content, "")
 		if err == nil && doc.Format == FormatMarkdown && len(doc.Sections) > 0 {
 			chunks = StructureAwareChunk(doc, *chunkCfg)
@@ -415,6 +573,8 @@ func (r *MultiFileRetriever) IndexDocument(ctx context.Context, fileID, fileName
 				doc.Format, len(doc.Sections))
 		}
 	}
+
+	// 4. 通用固定窗口分块 (兜底)
 	if len(chunks) == 0 {
 		chunks = ChunkDocument(content, *chunkCfg)
 	}
@@ -429,9 +589,15 @@ func (r *MultiFileRetriever) IndexDocument(ctx context.Context, fileID, fileName
 		return result, nil
 	}
 
+	// Parent-Child 模式下，Embedding 使用子块文本（EmbeddingContent），
+	// 而存入 Redis 的 content 字段使用父块文本（Content）
 	texts := make([]string, len(chunks))
 	for i, c := range chunks {
-		texts[i] = c.Content
+		if c.EmbeddingContent != "" {
+			texts[i] = c.EmbeddingContent
+		} else {
+			texts[i] = c.Content
+		}
 	}
 
 	// 分批大小控制：过大会触发 API 速率限制或超时，过小则增加网络往返开销
@@ -520,7 +686,7 @@ func (r *MultiFileRetriever) IndexDocument(ctx context.Context, fileID, fileName
 		return result, err
 	}
 
-	prefix := generateUserIndexPrefix(r.retCfg.UserIndexPrefixTemplate, r.userID)
+	prefix = r.generatePrefix()
 	vectorField := r.retCfg.VectorFieldName
 	if vectorField == "" {
 		vectorField = "vector"
@@ -541,16 +707,23 @@ func (r *MultiFileRetriever) IndexDocument(ctx context.Context, fileID, fileName
 		}
 		vecBytes := Float32SliceToBytes(vec32)
 
+		fields := map[string]interface{}{
+			"content":     chunk.Content,
+			"file_id":     fileID,
+			"file_name":   fileName,
+			"chunk_id":    chunk.ChunkID,
+			"chunk_index": chunk.ChunkIndex,
+			vectorField:   vecBytes,
+		}
+
+		// Parent-Child 模式下额外存储 parent_chunk_id，供检索时去重
+		if chunk.ParentChunkID != "" {
+			fields["parent_chunk_id"] = chunk.ParentChunkID
+		}
+
 		entries = append(entries, VectorEntry{
-			Key: fmt.Sprintf("%s%s", prefix, chunk.ChunkID),
-			Fields: map[string]interface{}{
-				"content":     chunk.Content,
-				"file_id":     fileID,
-				"file_name":   fileName,
-				"chunk_id":    chunk.ChunkID,
-				"chunk_index": chunk.ChunkIndex,
-				vectorField:   vecBytes,
-			},
+			Key:    fmt.Sprintf("%s%s", prefix, chunk.ChunkID),
+			Fields: fields,
 		})
 	}
 
@@ -571,8 +744,8 @@ func (r *MultiFileRetriever) IndexDocument(ctx context.Context, fileID, fileName
 // 底层通过 FT.SEARCH 按 file_id TAG 过滤找到该文件的所有 chunk Key，再逐一 DEL。
 // 这种基于标签的删除方式无需维护文件到 chunk 的映射表，简化了数据模型。
 func (r *MultiFileRetriever) DeleteDocument(ctx context.Context, fileID string) (*DeleteResult, error) {
-	indexName := generateUserIndexName(r.retCfg.UserIndexNameTemplate, r.userID)
-	prefix := generateUserIndexPrefix(r.retCfg.UserIndexPrefixTemplate, r.userID)
+	indexName := r.generateIndexName()
+	prefix := r.generatePrefix()
 
 	deleted, err := r.store.DeleteByFileID(ctx, indexName, prefix, fileID)
 	if err != nil {
@@ -594,6 +767,44 @@ func (r *MultiFileRetriever) embedWithoutCache(ctx context.Context, texts []stri
 		return r.embedding.EmbedStrings(ctx, texts)
 	}
 	return nil, NewRAGError(ErrCodeManagerNotReady, "no embedding source", nil)
+}
+
+// generateIndexName 生成包含 collection 的索引名
+// 当 collection 为空时，使用原始模板（向后兼容）
+// 当指定 collection 时，在索引名中插入 collection 名称实现知识库隔离
+func (r *MultiFileRetriever) generateIndexName() string {
+	baseName := generateUserIndexName(r.retCfg.UserIndexNameTemplate, r.userID)
+	if r.collection == "" || r.collection == "default" {
+		return baseName
+	}
+	// 在索引名中插入 collection: "mcp_rag_user_1:idx" → "mcp_rag_user_1_mylib:idx"
+	return strings.Replace(baseName, ":idx", "_"+r.collection+":idx", 1)
+}
+
+// generatePrefix 生成包含 collection 的 Key 前缀
+func (r *MultiFileRetriever) generatePrefix() string {
+	basePrefix := generateUserIndexPrefix(r.retCfg.UserIndexPrefixTemplate, r.userID)
+	if r.collection == "" || r.collection == "default" {
+		return basePrefix
+	}
+	// 在前缀中插入 collection: "mcp_rag_user_1:" → "mcp_rag_user_1_mylib:"
+	basePrefix = strings.TrimSuffix(basePrefix, ":")
+	return basePrefix + "_" + r.collection + ":"
+}
+
+// getOversamplingMultiple 获取混合检索过采样倍数，可配置，默认 3
+func (r *MultiFileRetriever) getOversamplingMultiple() int {
+	m := r.retCfg.HybridOversamplingMultiple
+	if m >= 2.0 && m <= 10.0 {
+		return int(m)
+	}
+	return 3 // 默认值
+}
+
+// ListDocuments 列出当前用户（当前集合）下的所有文档
+func (r *MultiFileRetriever) ListDocuments(ctx context.Context) ([]DocumentMeta, error) {
+	indexName := r.generateIndexName()
+	return r.store.ListDocuments(ctx, indexName)
 }
 
 // generateUserIndexName 根据模板生成用户专属的 RediSearch 索引名。

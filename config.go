@@ -6,42 +6,47 @@ config.go — TOML 配置加载、校验与领域配置转换
     字段均为原始类型，负责反序列化。
   - 领域层（rag.XxxConfig）: 各子系统实际使用的配置，包含经过校验和默认值
     填充的运行时参数。
+
 两层之间通过 To*Config() 系列方法桥接，使得 TOML 结构变更不会侵入业务逻辑。
 
 === 结构概览 ===
 
 常量:
-  DefaultMaxContentSize  — 文档内容大小上限（防止超大文件打爆内存）
+
+	DefaultMaxContentSize  — 文档内容大小上限（防止超大文件打爆内存）
 
 类型:
-  ServerConfig           — TOML 顶层配置，聚合所有子配置段
-  ServerSection          — 服务器基础信息（端口/名称/实例标识）
-  RedisSection           — Redis 连接配置，支持 standalone/sentinel/cluster 三种模式
-  RetrieverSection       — 向量检索器配置（索引算法/批量参数/混合检索权重）
-  ChunkingSection        — 文档分块策略参数
-  EmbMgrSection          — Embedding 管理器配置（负载均衡/重试/熔断/健康检查）
-  ProviderSection        — 单个 Embedding Provider 的连接与限流参数
-  CacheSection           — 本地 + Redis 二级缓存策略
-  RerankSection          — 重排序服务配置
-  AsyncIndexSection      — 异步索引任务队列配置（基于 Redis Stream）
-  MigrationSection       — Schema 版本迁移配置
-  Duration               — time.Duration 的 TOML 友好包装（支持 "30s"/"5m" 等字符串）
+
+	ServerConfig           — TOML 顶层配置，聚合所有子配置段
+	ServerSection          — 服务器基础信息（端口/名称/实例标识）
+	RedisSection           — Redis 连接配置，支持 standalone/sentinel/cluster 三种模式
+	RetrieverSection       — 向量检索器配置（索引算法/批量参数/混合检索权重）
+	ChunkingSection        — 文档分块策略参数
+	EmbMgrSection          — Embedding 管理器配置（负载均衡/重试/熔断/健康检查）
+	ProviderSection        — 单个 Embedding Provider 的连接与限流参数
+	CacheSection           — 本地 + Redis 二级缓存策略
+	RerankSection          — 重排序服务配置
+	AsyncIndexSection      — 异步索引任务队列配置（基于 Redis Stream）
+	MigrationSection       — Schema 版本迁移配置
+	Duration               — time.Duration 的 TOML 友好包装（支持 "30s"/"5m" 等字符串）
 
 函数:
-  resolveEnvVar(value)           — 将 ${VAR} 占位符替换为环境变量值
-  LoadConfig(path)               — 加载 TOML → 填充默认值 → 替换环境变量 → 校验
-  NewConfigError(phase, detail)  — 统一构造配置错误（携带阶段标识便于定位）
+
+	resolveEnvVar(value)           — 将 ${VAR} 占位符替换为环境变量值
+	LoadConfig(path)               — 加载 TOML → 填充默认值 → 替换环境变量 → 校验
+	NewConfigError(phase, detail)  — 统一构造配置错误（携带阶段标识便于定位）
 
 方法（ServerConfig）:
-  Validate()             — 快速失败校验：Redis 模式约束、Provider 必填项、参数合理性
-  ToRetrieverConfig()    — 转换为 rag.RetrieverConfig（含 HNSW 参数条件组装）
-  ToChunkingConfig()     — 转换为 rag.ChunkingConfig
-  ToManagerConfig()      — 转换为 rag.ManagerConfig（以 DefaultManagerConfig 为基础覆盖）
-  ToProviderConfigs()    — 转换为 []rag.ProviderConfig
-  ToCacheConfig()        — 转换为 rag.CacheConfig
-  ToTaskQueueConfig()    — 转换为 rag.TaskQueueConfig
-  ToRerankConfig()       — 转换为 rag.RerankConfig
-  ToMigrationConfig()    — 转换为 rag.MigrationConfig
+
+	Validate()             — 快速失败校验：Redis 模式约束、Provider 必填项、参数合理性
+	ToRetrieverConfig()    — 转换为 rag.RetrieverConfig（含 HNSW 参数条件组装）
+	ToChunkingConfig()     — 转换为 rag.ChunkingConfig
+	ToManagerConfig()      — 转换为 rag.ManagerConfig（以 DefaultManagerConfig 为基础覆盖）
+	ToProviderConfigs()    — 转换为 []rag.ProviderConfig
+	ToCacheConfig()        — 转换为 rag.CacheConfig
+	ToTaskQueueConfig()    — 转换为 rag.TaskQueueConfig
+	ToRerankConfig()       — 转换为 rag.RerankConfig
+	ToMigrationConfig()    — 转换为 rag.MigrationConfig
 */
 package main
 
@@ -67,16 +72,21 @@ const (
 // 所有业务逻辑不应直接读取本结构，而应通过 To*Config() 转为领域配置使用，
 // 这样 TOML schema 的演进不会影响下游子系统。
 type ServerConfig struct {
-	Server     ServerSection     `toml:"server"`
-	Redis      RedisSection      `toml:"redis"`
-	Retriever  RetrieverSection  `toml:"retriever"`
-	Chunking   ChunkingSection   `toml:"chunking"`
-	EmbMgr     EmbMgrSection     `toml:"embedding_manager"`
-	Providers  []ProviderSection `toml:"embedding_providers"`
-	Cache      CacheSection      `toml:"cache"`
-	Rerank     RerankSection     `toml:"rerank"`
-	AsyncIndex AsyncIndexSection `toml:"async_index"`
-	Migration  MigrationSection  `toml:"migration"`
+	Server            ServerSection            `toml:"server"`
+	Redis             RedisSection             `toml:"redis"`
+	Retriever         RetrieverSection         `toml:"retriever"`
+	Chunking          ChunkingSection          `toml:"chunking"`
+	EmbMgr            EmbMgrSection            `toml:"embedding_manager"`
+	Providers         []ProviderSection        `toml:"embedding_providers"`
+	Cache             CacheSection             `toml:"cache"`
+	Rerank            RerankSection            `toml:"rerank"`
+	AsyncIndex        AsyncIndexSection        `toml:"async_index"`
+	Migration         MigrationSection         `toml:"migration"`
+	HyDE              HyDESection              `toml:"hyde"`
+	VectorStore       *VectorStoreSection      `toml:"vector_store"`
+	GraphRAG          GraphRAGSection          `toml:"graph_rag"`
+	MultiQuery        MultiQuerySection        `toml:"multi_query"`
+	ContextCompressor ContextCompressorSection `toml:"context_compressor"`
 }
 
 // ServerSection 服务器配置
@@ -94,15 +104,37 @@ type ServerSection struct {
 // 而非破坏性地移除 addr，避免用户升级时配置报错。
 type RedisSection struct {
 	Mode         string   `toml:"mode"`        // "standalone" / "sentinel" / "cluster"
-	Addr         string   `toml:"addr"`         // standalone 单地址（向后兼容）
-	Addrs        []string `toml:"addrs"`        // sentinel/cluster 多地址
-	MasterName   string   `toml:"master_name"`  // sentinel master 名称
+	Addr         string   `toml:"addr"`        // standalone 单地址（向后兼容）
+	Addrs        []string `toml:"addrs"`       // sentinel/cluster 多地址
+	MasterName   string   `toml:"master_name"` // sentinel master 名称
 	Password     string   `toml:"password"`
 	DB           int      `toml:"db"`
 	DialTimeout  Duration `toml:"dial_timeout"`
 	ReadTimeout  Duration `toml:"read_timeout"`
 	WriteTimeout Duration `toml:"write_timeout"`
 	PoolSize     int      `toml:"pool_size"`
+}
+
+// MultiQuerySection 多查询检索配置
+type MultiQuerySection struct {
+	Enabled     bool     `toml:"enabled"`
+	BaseURL     string   `toml:"base_url"`
+	APIKey      string   `toml:"api_key"`
+	Model       string   `toml:"model"`
+	NumVariants int      `toml:"num_variants"`
+	Timeout     Duration `toml:"timeout"`
+}
+
+// ContextCompressorSection 上下文压缩配置
+type ContextCompressorSection struct {
+	Enabled        bool     `toml:"enabled"`
+	Type           string   `toml:"type"` // llm / embedding
+	BaseURL        string   `toml:"base_url"`
+	APIKey         string   `toml:"api_key"`
+	Model          string   `toml:"model"`
+	Timeout        Duration `toml:"timeout"`
+	SimilarityTopN int      `toml:"similarity_top_n"`
+	MinSimilarity  float64  `toml:"min_similarity"`
 }
 
 // RetrieverSection 检索器配置
@@ -135,10 +167,24 @@ type RetrieverSection struct {
 
 // ChunkingSection 分块配置
 type ChunkingSection struct {
-	MaxChunkSize   int  `toml:"max_chunk_size"`
-	MinChunkSize   int  `toml:"min_chunk_size"`
-	OverlapSize    int  `toml:"overlap_size"`
-	StructureAware bool `toml:"structure_aware"`
+	MaxChunkSize        int                     `toml:"max_chunk_size"`
+	MinChunkSize        int                     `toml:"min_chunk_size"`
+	OverlapSize         int                     `toml:"overlap_size"`
+	StructureAware      bool                    `toml:"structure_aware"`
+	ParentChildEnabled  bool                    `toml:"parent_child_enabled"`
+	ParentChunkSize     int                     `toml:"parent_chunk_size"`
+	ChildChunkSize      int                     `toml:"child_chunk_size"`
+	SemanticChunking    SemanticChunkingSection `toml:"semantic_chunking"`
+	CodeChunkingEnabled bool                    `toml:"code_chunking_enabled"`
+}
+
+// SemanticChunkingSection 语义分块配置
+type SemanticChunkingSection struct {
+	Enabled             bool    `toml:"enabled"`
+	WindowSize          int     `toml:"window_size"`
+	BreakpointThreshold float64 `toml:"breakpoint_threshold"`
+	MaxChunkSize        int     `toml:"max_chunk_size"`
+	MinChunkSize        int     `toml:"min_chunk_size"`
 }
 
 // EmbMgrSection Embedding 管理器配置
@@ -207,10 +253,76 @@ type AsyncIndexSection struct {
 
 // MigrationSection Schema 迁移配置
 type MigrationSection struct {
-	Enabled               bool   `toml:"enabled"`
-	AutoMigrateOnStartup  bool   `toml:"auto_migrate_on_startup"`
-	MetaPrefix            string `toml:"meta_prefix"`
-	BatchSize             int    `toml:"batch_size"`
+	Enabled              bool   `toml:"enabled"`
+	AutoMigrateOnStartup bool   `toml:"auto_migrate_on_startup"`
+	MetaPrefix           string `toml:"meta_prefix"`
+	BatchSize            int    `toml:"batch_size"`
+}
+
+// HyDESection 查询扩展 (HyDE) 配置
+type HyDESection struct {
+	Enabled     bool     `toml:"enabled"`
+	BaseURL     string   `toml:"base_url"`
+	APIKey      string   `toml:"api_key"`
+	Model       string   `toml:"model"`
+	MaxTokens   int      `toml:"max_tokens"`
+	Temperature float64  `toml:"temperature"`
+	Timeout     Duration `toml:"timeout"`
+}
+
+// VectorStoreSection VectorStore 后端配置
+type VectorStoreSection struct {
+	Type   string        `toml:"type"` // redis / milvus / qdrant
+	Milvus MilvusSection `toml:"milvus"`
+	Qdrant QdrantSection `toml:"qdrant"`
+}
+
+// MilvusSection Milvus 配置
+type MilvusSection struct {
+	Addr       string   `toml:"addr"`
+	Token      string   `toml:"token"`
+	Database   string   `toml:"database"`
+	Timeout    Duration `toml:"timeout"`
+	MetricType string   `toml:"metric_type"`
+}
+
+// QdrantSection Qdrant 配置
+type QdrantSection struct {
+	Addr    string   `toml:"addr"`
+	APIKey  string   `toml:"api_key"`
+	Timeout Duration `toml:"timeout"`
+}
+
+// GraphRAGSection Graph RAG 配置
+type GraphRAGSection struct {
+	Enabled         bool                `toml:"enabled"`
+	GraphStoreType  string              `toml:"graph_store_type"` // neo4j / memory
+	EntityExtractor string              `toml:"entity_extractor"` // llm / simple
+	AutoExtract     bool                `toml:"auto_extract"`
+	SearchDepth     int                 `toml:"search_depth"`
+	MergeWithVector bool                `toml:"merge_with_vector"`
+	Neo4j           Neo4jSection        `toml:"neo4j"`
+	LLMExtractor    LLMExtractorSection `toml:"llm_extractor"`
+}
+
+// Neo4jSection Neo4j 配置
+type Neo4jSection struct {
+	URI            string   `toml:"uri"`
+	Username       string   `toml:"username"`
+	Password       string   `toml:"password"`
+	Database       string   `toml:"database"`
+	MaxConnPool    int      `toml:"max_conn_pool"`
+	ConnectTimeout Duration `toml:"connect_timeout"`
+}
+
+// LLMExtractorSection LLM 实体提取器配置
+type LLMExtractorSection struct {
+	BaseURL     string   `toml:"base_url"`
+	APIKey      string   `toml:"api_key"`
+	Model       string   `toml:"model"`
+	MaxTokens   int      `toml:"max_tokens"`
+	Temperature float64  `toml:"temperature"`
+	Timeout     Duration `toml:"timeout"`
 }
 
 // Duration 是 time.Duration 的 TOML 友好包装。
@@ -294,11 +406,14 @@ func LoadConfig(path string) (*ServerConfig, error) {
 	var allMissing []string
 	for i := range cfg.Providers {
 		if cfg.Providers[i].Enabled {
-			resolved, missing := resolveEnvVar(cfg.Providers[i].APIKey)
+			resolved, missing := resolveEnvVar(cfg.Providers[i].BaseURL)
+			cfg.Providers[i].BaseURL = resolved
+			allMissing = append(allMissing, missing...)
+			resolved, missing = resolveEnvVar(cfg.Providers[i].APIKey)
 			cfg.Providers[i].APIKey = resolved
 			allMissing = append(allMissing, missing...)
-			resolved, missing = resolveEnvVar(cfg.Providers[i].BaseURL)
-			cfg.Providers[i].BaseURL = resolved
+			resolved, missing = resolveEnvVar(cfg.Providers[i].Model)
+			cfg.Providers[i].Model = resolved
 			allMissing = append(allMissing, missing...)
 		}
 	}
@@ -306,10 +421,108 @@ func LoadConfig(path string) (*ServerConfig, error) {
 	cfg.Redis.Password = resolved
 	allMissing = append(allMissing, missing...)
 
+	// Rerank — base_url / api_key / model 环境变量解析
+	if cfg.Rerank.BaseURL != "" {
+		resolved, missing := resolveEnvVar(cfg.Rerank.BaseURL)
+		cfg.Rerank.BaseURL = resolved
+		allMissing = append(allMissing, missing...)
+	}
 	if cfg.Rerank.APIKey != "" {
 		resolved, missing := resolveEnvVar(cfg.Rerank.APIKey)
 		cfg.Rerank.APIKey = resolved
 		allMissing = append(allMissing, missing...)
+	}
+	if cfg.Rerank.Model != "" {
+		resolved, missing := resolveEnvVar(cfg.Rerank.Model)
+		cfg.Rerank.Model = resolved
+		allMissing = append(allMissing, missing...)
+	}
+
+	// HyDE — base_url / api_key / model 环境变量解析
+	if cfg.HyDE.BaseURL != "" {
+		resolved, missing := resolveEnvVar(cfg.HyDE.BaseURL)
+		cfg.HyDE.BaseURL = resolved
+		allMissing = append(allMissing, missing...)
+	}
+	if cfg.HyDE.APIKey != "" {
+		resolved, missing := resolveEnvVar(cfg.HyDE.APIKey)
+		cfg.HyDE.APIKey = resolved
+		allMissing = append(allMissing, missing...)
+	}
+	if cfg.HyDE.Model != "" {
+		resolved, missing := resolveEnvVar(cfg.HyDE.Model)
+		cfg.HyDE.Model = resolved
+		allMissing = append(allMissing, missing...)
+	}
+
+	// Multi-Query — base_url / api_key / model 环境变量解析
+	if cfg.MultiQuery.BaseURL != "" {
+		resolved, missing := resolveEnvVar(cfg.MultiQuery.BaseURL)
+		cfg.MultiQuery.BaseURL = resolved
+		allMissing = append(allMissing, missing...)
+	}
+	if cfg.MultiQuery.APIKey != "" {
+		resolved, missing := resolveEnvVar(cfg.MultiQuery.APIKey)
+		cfg.MultiQuery.APIKey = resolved
+		allMissing = append(allMissing, missing...)
+	}
+	if cfg.MultiQuery.Model != "" {
+		resolved, missing := resolveEnvVar(cfg.MultiQuery.Model)
+		cfg.MultiQuery.Model = resolved
+		allMissing = append(allMissing, missing...)
+	}
+
+	// Context Compressor — base_url / api_key / model 环境变量解析
+	if cfg.ContextCompressor.BaseURL != "" {
+		resolved, missing := resolveEnvVar(cfg.ContextCompressor.BaseURL)
+		cfg.ContextCompressor.BaseURL = resolved
+		allMissing = append(allMissing, missing...)
+	}
+	if cfg.ContextCompressor.APIKey != "" {
+		resolved, missing := resolveEnvVar(cfg.ContextCompressor.APIKey)
+		cfg.ContextCompressor.APIKey = resolved
+		allMissing = append(allMissing, missing...)
+	}
+	if cfg.ContextCompressor.Model != "" {
+		resolved, missing := resolveEnvVar(cfg.ContextCompressor.Model)
+		cfg.ContextCompressor.Model = resolved
+		allMissing = append(allMissing, missing...)
+	}
+
+	// Graph RAG — Neo4j 密码 + LLM Extractor (base_url / api_key / model) 环境变量解析
+	if cfg.GraphRAG.Neo4j.Password != "" {
+		resolved, missing := resolveEnvVar(cfg.GraphRAG.Neo4j.Password)
+		cfg.GraphRAG.Neo4j.Password = resolved
+		allMissing = append(allMissing, missing...)
+	}
+	if cfg.GraphRAG.LLMExtractor.BaseURL != "" {
+		resolved, missing := resolveEnvVar(cfg.GraphRAG.LLMExtractor.BaseURL)
+		cfg.GraphRAG.LLMExtractor.BaseURL = resolved
+		allMissing = append(allMissing, missing...)
+	}
+	if cfg.GraphRAG.LLMExtractor.APIKey != "" {
+		resolved, missing := resolveEnvVar(cfg.GraphRAG.LLMExtractor.APIKey)
+		cfg.GraphRAG.LLMExtractor.APIKey = resolved
+		allMissing = append(allMissing, missing...)
+	}
+	if cfg.GraphRAG.LLMExtractor.Model != "" {
+		resolved, missing := resolveEnvVar(cfg.GraphRAG.LLMExtractor.Model)
+		cfg.GraphRAG.LLMExtractor.Model = resolved
+		allMissing = append(allMissing, missing...)
+	}
+
+	// VectorStore — Milvus token + Qdrant api_key 环境变量解析
+	if cfg.VectorStore != nil {
+		if cfg.VectorStore.Milvus.Token != "" {
+			resolved, missing := resolveEnvVar(cfg.VectorStore.Milvus.Token)
+			cfg.VectorStore.Milvus.Token = resolved
+			allMissing = append(allMissing, missing...)
+		}
+		if cfg.VectorStore.Qdrant.APIKey != "" {
+			resolved, missing := resolveEnvVar(cfg.VectorStore.Qdrant.APIKey)
+			cfg.VectorStore.Qdrant.APIKey = resolved
+			allMissing = append(allMissing, missing...)
+		}
 	}
 
 	// 缺失的环境变量只告警不报错：某些变量可能是可选的（如 Rerank APIKey），
@@ -522,7 +735,174 @@ func (c *ServerConfig) ToRetrieverConfig() *rag.RetrieverConfig {
 		}
 	}
 
+	// 多查询检索配置桥接
+	retCfg.MultiQueryEnabled = c.MultiQuery.Enabled
+	if c.MultiQuery.Enabled {
+		mqModel := c.MultiQuery.Model
+		if mqModel == "" {
+			mqModel = "qwen-turbo"
+		}
+		mqBaseURL := c.MultiQuery.BaseURL
+		if mqBaseURL == "" {
+			mqBaseURL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+		}
+		mqNumVariants := c.MultiQuery.NumVariants
+		if mqNumVariants <= 0 {
+			mqNumVariants = 3
+		}
+		mqTimeout := c.MultiQuery.Timeout.Duration
+		if mqTimeout == 0 {
+			mqTimeout = 15 * time.Second
+		}
+		retCfg.MultiQueryConfig = &rag.MultiQueryConfig{
+			Enabled:     true,
+			BaseURL:     mqBaseURL,
+			APIKey:      c.MultiQuery.APIKey,
+			Model:       mqModel,
+			NumVariants: mqNumVariants,
+			Timeout:     mqTimeout,
+		}
+	}
+
+	// 上下文压缩配置桥接
+	retCfg.CompressorEnabled = c.ContextCompressor.Enabled
+	if c.ContextCompressor.Enabled {
+		compType := c.ContextCompressor.Type
+		if compType == "" {
+			compType = "embedding"
+		}
+		compTimeout := c.ContextCompressor.Timeout.Duration
+		if compTimeout == 0 {
+			compTimeout = 15 * time.Second
+		}
+		simTopN := c.ContextCompressor.SimilarityTopN
+		if simTopN <= 0 {
+			simTopN = 5
+		}
+		minSim := c.ContextCompressor.MinSimilarity
+		if minSim <= 0 {
+			minSim = 0.3
+		}
+		retCfg.CompressorConfig = &rag.CompressorConfig{
+			Enabled:        true,
+			Type:           compType,
+			BaseURL:        c.ContextCompressor.BaseURL,
+			APIKey:         c.ContextCompressor.APIKey,
+			Model:          c.ContextCompressor.Model,
+			Timeout:        compTimeout,
+			SimilarityTopN: simTopN,
+			MinSimilarity:  minSim,
+		}
+	}
+
+	// HyDE 配置桥接
+	retCfg.HyDEEnabled = c.HyDE.Enabled
+	if c.HyDE.Enabled {
+		model := c.HyDE.Model
+		if model == "" {
+			model = "gpt-3.5-turbo"
+		}
+		baseURL := c.HyDE.BaseURL
+		if baseURL == "" {
+			baseURL = "https://api.openai.com/v1"
+		}
+		maxTokens := c.HyDE.MaxTokens
+		if maxTokens == 0 {
+			maxTokens = 256
+		}
+		temp := c.HyDE.Temperature
+		if temp == 0 {
+			temp = 0.3
+		}
+		timeout := c.HyDE.Timeout.Duration
+		if timeout == 0 {
+			timeout = 10 * time.Second
+		}
+		retCfg.HyDEConfig = &rag.HyDEConfig{
+			BaseURL:     baseURL,
+			APIKey:      c.HyDE.APIKey,
+			Model:       model,
+			MaxTokens:   maxTokens,
+			Temperature: temp,
+			Timeout:     timeout,
+		}
+	}
+
 	return retCfg
+}
+
+// ToVectorStoreConfig 转换为 rag.VectorStoreConfig
+func (c *ServerConfig) ToVectorStoreConfig() rag.VectorStoreConfig {
+	typ := ""
+	if c.VectorStore != nil {
+		typ = c.VectorStore.Type
+	}
+	if typ == "" {
+		typ = "redis"
+	}
+
+	vsCfg := rag.VectorStoreConfig{Type: typ}
+
+	if c.VectorStore != nil {
+		vsCfg.Milvus = rag.MilvusConfig{
+			Addr:     c.VectorStore.Milvus.Addr,
+			Token:    c.VectorStore.Milvus.Token,
+			Database: c.VectorStore.Milvus.Database,
+			Timeout:  c.VectorStore.Milvus.Timeout.Duration,
+		}
+		vsCfg.Qdrant = rag.QdrantConfig{
+			Addr:    c.VectorStore.Qdrant.Addr,
+			APIKey:  c.VectorStore.Qdrant.APIKey,
+			Timeout: c.VectorStore.Qdrant.Timeout.Duration,
+		}
+	}
+
+	return vsCfg
+}
+
+// ToGraphRAGConfig 转换为 rag.GraphRAGConfig
+func (c *ServerConfig) ToGraphRAGConfig() rag.GraphRAGConfig {
+	cfg := rag.DefaultGraphRAGConfig()
+	cfg.Enabled = c.GraphRAG.Enabled
+
+	if c.GraphRAG.GraphStoreType != "" {
+		cfg.GraphStoreType = c.GraphRAG.GraphStoreType
+	}
+	if c.GraphRAG.EntityExtractor != "" {
+		cfg.EntityExtractor = c.GraphRAG.EntityExtractor
+	}
+	cfg.AutoExtract = c.GraphRAG.AutoExtract
+	if c.GraphRAG.SearchDepth > 0 {
+		cfg.SearchDepth = c.GraphRAG.SearchDepth
+	}
+	cfg.MergeWithVector = c.GraphRAG.MergeWithVector
+
+	// Neo4j 配置
+	if c.GraphRAG.Neo4j.URI != "" {
+		cfg.Neo4j.URI = c.GraphRAG.Neo4j.URI
+	}
+	if c.GraphRAG.Neo4j.Username != "" {
+		cfg.Neo4j.Username = c.GraphRAG.Neo4j.Username
+	}
+	if c.GraphRAG.Neo4j.Password != "" {
+		cfg.Neo4j.Password = c.GraphRAG.Neo4j.Password
+	}
+	if c.GraphRAG.Neo4j.Database != "" {
+		cfg.Neo4j.Database = c.GraphRAG.Neo4j.Database
+	}
+
+	// LLM 实体提取器配置
+	if c.GraphRAG.LLMExtractor.BaseURL != "" {
+		cfg.LLMExtractor.BaseURL = c.GraphRAG.LLMExtractor.BaseURL
+	}
+	if c.GraphRAG.LLMExtractor.APIKey != "" {
+		cfg.LLMExtractor.APIKey = c.GraphRAG.LLMExtractor.APIKey
+	}
+	if c.GraphRAG.LLMExtractor.Model != "" {
+		cfg.LLMExtractor.Model = c.GraphRAG.LLMExtractor.Model
+	}
+
+	return cfg
 }
 
 // ToChunkingConfig 转换为 rag.ChunkingConfig
@@ -539,11 +919,40 @@ func (c *ServerConfig) ToChunkingConfig() *rag.ChunkingConfig {
 	if overlap == 0 {
 		overlap = 200
 	}
+	parentSize := c.Chunking.ParentChunkSize
+	if parentSize == 0 {
+		parentSize = 1000
+	}
+	childSize := c.Chunking.ChildChunkSize
+	if childSize == 0 {
+		childSize = 200
+	}
+	// 语义分块配置
+	scCfg := rag.DefaultSemanticChunkingConfig()
+	scCfg.Enabled = c.Chunking.SemanticChunking.Enabled
+	if c.Chunking.SemanticChunking.WindowSize > 0 {
+		scCfg.WindowSize = c.Chunking.SemanticChunking.WindowSize
+	}
+	if c.Chunking.SemanticChunking.BreakpointThreshold > 0 {
+		scCfg.BreakpointThreshold = c.Chunking.SemanticChunking.BreakpointThreshold
+	}
+	if c.Chunking.SemanticChunking.MaxChunkSize > 0 {
+		scCfg.MaxChunkSize = c.Chunking.SemanticChunking.MaxChunkSize
+	}
+	if c.Chunking.SemanticChunking.MinChunkSize > 0 {
+		scCfg.MinChunkSize = c.Chunking.SemanticChunking.MinChunkSize
+	}
+
 	return &rag.ChunkingConfig{
-		MaxChunkSize:   maxChunk,
-		MinChunkSize:   minChunk,
-		OverlapSize:    overlap,
-		StructureAware: c.Chunking.StructureAware,
+		MaxChunkSize:        maxChunk,
+		MinChunkSize:        minChunk,
+		OverlapSize:         overlap,
+		StructureAware:      c.Chunking.StructureAware,
+		ParentChildEnabled:  c.Chunking.ParentChildEnabled,
+		ParentChunkSize:     parentSize,
+		ChildChunkSize:      childSize,
+		SemanticChunking:    scCfg,
+		CodeChunkingEnabled: c.Chunking.CodeChunkingEnabled,
 	}
 }
 

@@ -26,15 +26,17 @@ import (
 
 // IndexWorker 异步索引 Worker Pool
 type IndexWorker struct {
-	queue    *TaskQueue
-	store    VectorStore
-	retCfg   *RetrieverConfig
-	chunkCfg *ChunkingConfig
-	consumer string
-	workers  int
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
+	queue           *TaskQueue
+	store           VectorStore
+	retCfg          *RetrieverConfig
+	chunkCfg        *ChunkingConfig
+	consumer        string
+	workers         int
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	graphStore      GraphStore      // 可选: 用于异步任务完成后自动提取实体
+	entityExtractor EntityExtractor // 可选: 实体提取器
 }
 
 // NewIndexWorker 创建 Worker
@@ -56,6 +58,12 @@ func NewIndexWorker(queue *TaskQueue, store VectorStore, retCfg *RetrieverConfig
 		ctx:      ctx,
 		cancel:   cancel,
 	}
+}
+
+// SetGraphRAG 设置 Graph RAG 依赖，用于异步任务完成后自动提取实体
+func (w *IndexWorker) SetGraphRAG(graphStore GraphStore, extractor EntityExtractor) {
+	w.graphStore = graphStore
+	w.entityExtractor = extractor
 }
 
 // Start 启动 worker pool
@@ -159,10 +167,16 @@ func (w *IndexWorker) processTask(workerName string, task *IndexTask) {
 		errMsg := fmt.Sprintf("index document: %v", err)
 		logrus.Errorf("[IndexWorker] %s task %s failed: %s", workerName, task.TaskID, errMsg)
 		_ = w.queue.UpdateStatus(w.ctx, task.TaskID, TaskStatusFailed, nil, errMsg)
+		// 失败时也发送 Webhook 通知
+		w.queue.NotifyWebhook(&IndexTask{TaskID: task.TaskID, FileID: task.FileID, FileName: task.FileName, UserID: task.UserID, Status: TaskStatusFailed, Error: errMsg})
 	} else {
 		logrus.Infof("[IndexWorker] %s task %s completed: indexed=%d, failed=%d",
 			workerName, task.TaskID, result.Indexed, result.Failed)
 		_ = w.queue.UpdateStatus(w.ctx, task.TaskID, TaskStatusCompleted, result, "")
+		// 索引成功后自动提取实体（非阻塞）
+		w.extractEntitiesAsync(content, task.FileID)
+		// 成功时发送 Webhook 通知
+		w.queue.NotifyWebhook(&IndexTask{TaskID: task.TaskID, FileID: task.FileID, FileName: task.FileName, UserID: task.UserID, Status: TaskStatusCompleted, Result: result})
 	}
 
 	if task.MessageID != "" {
@@ -170,4 +184,39 @@ func (w *IndexWorker) processTask(workerName string, task *IndexTask) {
 			logrus.Warnf("[IndexWorker] %s ack error for %s: %v", workerName, task.MessageID, ackErr)
 		}
 	}
+}
+
+// extractEntitiesAsync 异步任务完成后自动提取实体和关系写入图存储
+// 将实体提取集成到 Worker 中，而非 tools 层的 fire-and-forget，提供更好的可视性
+func (w *IndexWorker) extractEntitiesAsync(content, fileID string) {
+	if w.graphStore == nil || w.entityExtractor == nil {
+		return
+	}
+
+	go func() {
+		extractCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+
+		entities, relations, err := w.entityExtractor.Extract(extractCtx, content, fileID)
+		if err != nil {
+			logrus.Warnf("[IndexWorker] Entity extraction failed for %s: %v", fileID, err)
+			return
+		}
+
+		if len(entities) > 0 {
+			if err := w.graphStore.AddEntities(extractCtx, entities); err != nil {
+				logrus.Warnf("[IndexWorker] Failed to store entities for %s: %v", fileID, err)
+			}
+		}
+		if len(relations) > 0 {
+			if err := w.graphStore.AddRelations(extractCtx, relations); err != nil {
+				logrus.Warnf("[IndexWorker] Failed to store relations for %s: %v", fileID, err)
+			}
+		}
+
+		if len(entities) > 0 || len(relations) > 0 {
+			logrus.Infof("[IndexWorker] Graph RAG: extracted %d entities, %d relations for file %s",
+				len(entities), len(relations), fileID)
+		}
+	}()
 }

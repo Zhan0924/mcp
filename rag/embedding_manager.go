@@ -120,7 +120,7 @@ const (
 // ProviderConfig 单个 Embedding Provider 的配置
 type ProviderConfig struct {
 	Name      string        `toml:"name"`
-	Type      string        `toml:"type"`    // 对应 RegisterFactory 注册的 type key
+	Type      string        `toml:"type"` // 对应 RegisterFactory 注册的 type key
 	BaseURL   string        `toml:"base_url"`
 	APIKey    string        `toml:"api_key"`
 	Model     string        `toml:"model"`
@@ -135,12 +135,12 @@ type ProviderConfig struct {
 // ManagerConfig 管理器全局配置
 type ManagerConfig struct {
 	Strategy            LoadBalanceStrategy `toml:"strategy"`
-	MaxRetries          int                 `toml:"max_retries"`          // 最大重试次数（不含首次）
-	RetryDelay          time.Duration       `toml:"retry_delay"`          // 首次重试基础延迟
-	RetryMaxDelay       time.Duration       `toml:"retry_max_delay"`      // 指数退避上限
-	RetryMultiplier     float64             `toml:"retry_multiplier"`     // 退避倍数，每次重试 delay *= multiplier
-	CircuitThreshold    int                 `toml:"circuit_threshold"`    // 连续失败多少次触发熔断
-	CircuitTimeout      time.Duration       `toml:"circuit_timeout"`      // Open 态持续多久后进入 HalfOpen
+	MaxRetries          int                 `toml:"max_retries"`           // 最大重试次数（不含首次）
+	RetryDelay          time.Duration       `toml:"retry_delay"`           // 首次重试基础延迟
+	RetryMaxDelay       time.Duration       `toml:"retry_max_delay"`       // 指数退避上限
+	RetryMultiplier     float64             `toml:"retry_multiplier"`      // 退避倍数，每次重试 delay *= multiplier
+	CircuitThreshold    int                 `toml:"circuit_threshold"`     // 连续失败多少次触发熔断
+	CircuitTimeout      time.Duration       `toml:"circuit_timeout"`       // Open 态持续多久后进入 HalfOpen
 	CircuitHalfOpenMax  int                 `toml:"circuit_half_open_max"` // HalfOpen 态允许的最大探测请求数
 	HealthCheckInterval time.Duration       `toml:"health_check_interval"`
 	HealthCheckTimeout  time.Duration       `toml:"health_check_timeout"`
@@ -265,12 +265,28 @@ func NewManager(config ManagerConfig) *Manager {
 
 // AddProvider 通过工厂创建 Embedder 并注册为 Provider
 // 新 Provider 以 CircuitStateClosed（乐观假设）初始化：
-//   假定新加入的后端是健康的，由实际请求结果驱动熔断状态变化
-//   若初始化为 Open 则需要等一个健康检查周期才能使用，影响首次请求延迟
+//
+//	假定新加入的后端是健康的，由实际请求结果驱动熔断状态变化
+//	若初始化为 Open 则需要等一个健康检查周期才能使用，影响首次请求延迟
 func (m *Manager) AddProvider(ctx context.Context, config ProviderConfig) error {
 	if !config.Enabled {
 		logrus.Infof("[EmbeddingManager] Provider %s is disabled, skipping", config.Name)
 		return nil
+	}
+
+	// 维度一致性检查：所有启用的 Provider 维度必须相同，否则故障转移时维度变化会导致索引查询失败
+	if config.Dimension > 0 {
+		m.mu.RLock()
+		for _, p := range m.providers {
+			if p.config.Dimension > 0 && p.config.Dimension != config.Dimension {
+				m.mu.RUnlock()
+				logrus.Warnf("[EmbeddingManager] DIMENSION MISMATCH: provider %s (dim=%d) vs %s (dim=%d). "+
+					"Failover between these providers will cause index query failures!",
+					config.Name, config.Dimension, p.config.Name, p.config.Dimension)
+				break
+			}
+		}
+		m.mu.RUnlock()
 	}
 
 	factory, ok := GetFactory(config.Type)
@@ -515,9 +531,10 @@ func (m *Manager) selectWeighted(providers []*Provider) *Provider {
 }
 
 // canUseProvider 熔断器状态机判定
-//   Closed   → 放行
-//   Open     → 检查超时：已过冷却期则转 HalfOpen 并放行，否则快速拒绝
-//   HalfOpen → 限流放行：已放行探测数 < HalfOpenMax 则放行，否则拒绝
+//
+//	Closed   → 放行
+//	Open     → 检查超时：已过冷却期则转 HalfOpen 并放行，否则快速拒绝
+//	HalfOpen → 限流放行：已放行探测数 < HalfOpenMax 则放行，否则拒绝
 func (m *Manager) canUseProvider(provider *Provider) bool {
 	provider.mu.Lock()
 	defer provider.mu.Unlock()

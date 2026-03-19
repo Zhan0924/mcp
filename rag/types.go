@@ -2,12 +2,13 @@
 rag/types.go — RAG 对外 API 边界类型定义
 
 设计原则:
-  本文件定义的结构体是 rag 包与上层 MCP tools 层之间的「契约类型」。
-  tools 层（tools/rag_tools.go）将这些结构体序列化为 JSON 返回给 MCP 客户端，
-  因此:
-    1. 所有字段均带 json tag，字段命名遵循 snake_case 以符合 JSON 惯例
-    2. omitempty 仅用于真正可选的字段（如 Cached、Format），避免零值噪声
-    3. 结构体只携带数据，不包含行为方法——保持纯 DTO 语义
+
+	本文件定义的结构体是 rag 包与上层 MCP tools 层之间的「契约类型」。
+	tools 层（tools/rag_tools.go）将这些结构体序列化为 JSON 返回给 MCP 客户端，
+	因此:
+	  1. 所有字段均带 json tag，字段命名遵循 snake_case 以符合 JSON 惯例
+	  2. omitempty 仅用于真正可选的字段（如 Cached、Format），避免零值噪声
+	  3. 结构体只携带数据，不包含行为方法——保持纯 DTO 语义
 
 导出结构体:
   - RetrievalResult  — 单条检索命中结果（query 操作返回）
@@ -26,9 +27,10 @@ import "github.com/google/uuid"
 // RelevanceScore 已经过归一化（0~1），分数越高相关性越强。
 type RetrievalResult struct {
 	ChunkID        string  `json:"chunk_id"`
+	ParentChunkID  string  `json:"parent_chunk_id,omitempty"` // 用于 Parent-Child Retriever 的分组去重
 	FileID         string  `json:"file_id"`
 	FileName       string  `json:"file_name"`
-	ChunkIndex     int     `json:"chunk_index"`     // 该 chunk 在原始文档中的顺序号，便于上层重建上下文
+	ChunkIndex     int     `json:"chunk_index"` // 该 chunk 在原始文档中的顺序号，便于上层重建上下文
 	Content        string  `json:"content"`
 	RelevanceScore float64 `json:"relevance_score"` // 归一化相关性得分 [0, 1]
 }
@@ -39,10 +41,10 @@ type IndexResult struct {
 	FileID      string `json:"file_id"`
 	FileName    string `json:"file_name"`
 	TotalChunks int    `json:"total_chunks"`
-	Indexed     int    `json:"indexed"`           // 本次新写入 Redis 的 chunk 数
-	Failed      int    `json:"failed"`            // 写入失败的 chunk 数
-	Cached      int    `json:"cached,omitempty"`  // 命中 embedding 缓存而跳过重新计算的 chunk 数
-	Format      string `json:"format,omitempty"`  // 检测到的文档格式（markdown / txt / pdf）
+	Indexed     int    `json:"indexed"`          // 本次新写入 Redis 的 chunk 数
+	Failed      int    `json:"failed"`           // 写入失败的 chunk 数
+	Cached      int    `json:"cached,omitempty"` // 命中 embedding 缓存而跳过重新计算的 chunk 数
+	Format      string `json:"format,omitempty"` // 检测到的文档格式（markdown / txt / pdf）
 }
 
 // DeleteResult 文档删除操作的汇总报告。
