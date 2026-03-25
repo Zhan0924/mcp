@@ -140,12 +140,13 @@ services:
       - neo4j_data:/data          # 数据持久化
       - neo4j_logs:/logs          # 日志
     healthcheck:
-      # 通过 Cypher 命令验证数据库完全就绪
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
-      interval: 15s
+      # 通过 Cypher 命令验证 Bolt 端口和数据库引擎完全就绪
+      # 之前仅检测 HTTP 7474，但 Bolt 7687 可能还未就绪，导致 mcp-rag-server 连接 refused
+      test: ["CMD-SHELL", "echo 'RETURN 1;' | cypher-shell -u neo4j -p ${GRAPH_NEO4J_PASSWORD:-neo4j_rag_2024} -a bolt://localhost:7687 || exit 1"]
+      interval: 10s
       timeout: 10s
-      retries: 10
-      start_period: 30s           # Neo4j 冷启动需 20-40s
+      retries: 15
+      start_period: 45s           # Neo4j 冷启动需 30-60s，给足初始化时间
     networks:
       - rag-network
 

@@ -47,9 +47,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	embeddingArk "github.com/cloudwego/eino-ext/components/embedding/ark"
 	"github.com/cloudwego/eino/components/embedding"
@@ -186,6 +188,12 @@ func (r *MultiFileRetriever) embedTexts(ctx context.Context, texts []string) ([]
 //  4. 根据配置选择纯向量检索或混合检索
 //  5. 对结果执行最低分阈值过滤
 func (r *MultiFileRetriever) Retrieve(ctx context.Context, query string, fileIDs []string) ([]RetrievalResult, error) {
+	// ── 查询预校验：拦截空查询、纯占位符等无意义查询，避免浪费 LLM 调用 ──
+	if !isValidQuery(query) {
+		logrus.Warnf("[RAG Query] Rejected invalid/empty query for user %d: %q", r.userID, query)
+		return []RetrievalResult{}, nil
+	}
+
 	logrus.Infof("[RAG Query] Starting retrieval for user %d, query: %s, fileIDs: %v", r.userID, query, fileIDs)
 
 	originalQuery := query
@@ -825,6 +833,63 @@ func generateUserIndexPrefix(template string, userID uint) string {
 		template = "rag_user_%d:"
 	}
 	return fmt.Sprintf(template, userID)
+}
+
+// isValidQuery 校验查询是否有意义，过滤掉垃圾/占位符查询。
+// 拦截以下情况：
+//   - 空白查询或纯空格
+//   - 有效字符不足 2 个（如单个标点）
+//   - 已知的占位符模式："Unknown task"、"Compare  and "、"Unknown question" 等
+//     （这些通常是 MCP 客户端探测/初始化时发送的无意义查询）
+//   - 纯标点/符号
+func isValidQuery(query string) bool {
+	trimmed := strings.TrimSpace(query)
+	if trimmed == "" {
+		return false
+	}
+
+	// 有效字符数不足 2 个（排除纯标点、单个字母等）
+	if utf8.RuneCountInString(trimmed) < 2 {
+		return false
+	}
+
+	// 已知的占位符/垃圾查询模式（不区分大小写）
+	lower := strings.ToLower(trimmed)
+	junkPatterns := []string{
+		"unknown task",
+		"unknown topic",
+		"unknown question",
+		"compare  and", // 两个空格之间无内容的 "Compare  and "
+	}
+	for _, pattern := range junkPatterns {
+		if strings.TrimSpace(lower) == strings.TrimSpace(pattern) {
+			return false
+		}
+	}
+
+	// "Compare  and " 的宽松匹配："compare" + 大量空格 + "and" + 可选空格
+	compareAndRe := regexp.MustCompile(`(?i)^compare\s+and\s*$`)
+	if compareAndRe.MatchString(trimmed) {
+		return false
+	}
+
+	// 移除所有标点和空格后为空 → 纯符号查询
+	stripped := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			return -1
+		}
+		// 保留字母、数字、CJK 等有意义的字符
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r >= 0x4E00 { // 0x4E00 = CJK 统一汉字起始
+			return r
+		}
+		return -1
+	}, trimmed)
+	if len(stripped) == 0 {
+		return false
+	}
+
+	return true
 }
 
 // escapeTagValue 转义 RediSearch TAG 字段查询中的特殊字符。

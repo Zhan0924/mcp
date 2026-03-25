@@ -378,14 +378,19 @@ func isDOCXContent(content string) bool {
 // --- Tool 3: rag_index_url ---
 
 func (p *RAGToolProvider) indexURLTool() Tool {
-	definition := mcp.NewTool(
-		"rag_index_url",
-		mcp.WithDescription("网页索引：抓取指定 URL 的网页内容，自动提取正文（去除 HTML 标签），分块向量化后存入知识库索引。适用于将在线文档、博客文章、技术文档等网页内容纳入 RAG 检索范围。"),
+	toolOpts := []mcp.ToolOption{
+		mcp.WithDescription("网页索引：抓取指定 URL 的网页内容，自动提取正文（去除 HTML 标签），分块向量化后存入知识库索引。适用于将在线文档、博客文章、技术文档等网页内容纳入 RAG 检索范围。对于内容较多的网页，建议设置 async=true 异步索引以避免超时。"),
 		mcp.WithString("url", mcp.Description("要抓取的网页 URL（必须是 http:// 或 https:// 开头）"), mcp.Required()),
 		mcp.WithNumber("user_id", mcp.Description("用户 ID"), mcp.Required()),
 		mcp.WithString("file_id", mcp.Description("文件唯一标识（可选，默认根据 URL 自动生成）")),
 		mcp.WithString("file_name", mcp.Description("文件名（可选，默认使用 URL）")),
-	)
+	}
+	if p.taskQueue != nil {
+		toolOpts = append(toolOpts,
+			mcp.WithBoolean("async", mcp.Description("是否异步索引（默认 false）。大网页建议开启，避免 Embedding 批量超时触发熔断。启用后立即返回 task_id。")),
+		)
+	}
+	definition := mcp.NewTool("rag_index_url", toolOpts...)
 
 	return NewBaseTool(definition, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		ctx, cancel := context.WithTimeout(ctx, defaultToolTimeout)
@@ -479,7 +484,28 @@ func (p *RAGToolProvider) indexURLTool() Tool {
 			return toolError(rag.ErrCodeInvalidInput, "URL content is empty after HTML parsing")
 		}
 
-		// --- 3. 复用已有索引流程 ---
+		// --- 3. 异步模式：大网页提交到 TaskQueue，避免同步超时触发 Embedding 熔断 ---
+		asyncMode, _ := args["async"].(bool)
+		if asyncMode && p.taskQueue != nil {
+			taskID, err := p.taskQueue.Submit(ctx, userID, fileID, fileName, content, "markdown")
+			if err != nil {
+				logrus.Errorf("[rag_index_url] Async submit failed: %v", err)
+				return toolError(rag.ErrCodeBatchFailed, "async submit failed: "+err.Error())
+			}
+			result := map[string]interface{}{
+				"url":       rawURL,
+				"file_id":   fileID,
+				"file_name": fileName,
+				"task_id":   taskID,
+				"status":    rag.TaskStatusPending,
+				"chars":     len(content),
+				"message":   "URL content fetched and submitted for async indexing. Use rag_task_status to check progress.",
+			}
+			data, _ := json.MarshalIndent(result, "", "  ")
+			return mcp.NewToolResultText(string(data)), nil
+		}
+
+		// --- 4. 同步模式：复用已有索引流程 ---
 		retriever, err := p.createRetriever(ctx, userID)
 		if err != nil {
 			logrus.Errorf("[rag_index_url] Failed to create retriever: %v", err)
@@ -923,7 +949,7 @@ func (p *RAGToolProvider) listDocumentsTool() Tool {
 
 		output := map[string]interface{}{
 			"total_documents": len(docs),
-			"documents":      docs,
+			"documents":       docs,
 		}
 
 		data, err := json.MarshalIndent(output, "", "  ")

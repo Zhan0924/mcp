@@ -81,6 +81,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -1058,17 +1059,54 @@ func parseRawRESP3(mapResult map[interface{}]interface{}) ([]VectorSearchResult,
 	return results, nil
 }
 
-// escapeRedisQuery 转义 Redis 查询字符串中的特殊字符
-// RediSearch 查询语法中以下字符有特殊含义，需要用 \ 转义以作为字面值匹配
+// escapeRedisQuery 转义 Redis 查询字符串中的特殊字符，并清理不适合作为 BM25 查询的内容。
+//
+// HyDE 生成的假想文档可能包含代码片段（如 `def handle_unknown_question(`、换行符、
+// 引号等），这些内容的特殊字符若未正确处理会导致 RediSearch 查询语法错误。
+// 策略：先清理控制字符和多余空白，再转义 RediSearch 特殊字符，最后截断过长查询以避免性能问题。
 func escapeRedisQuery(query string) string {
+	// 1. 替换换行、制表符等控制字符为空格，避免 RediSearch 解析失败
+	result := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return ' '
+		}
+		return r
+	}, query)
+
+	// 2. 压缩连续空格为单个空格
+	spaceRe := regexp.MustCompile(`\s+`)
+	result = spaceRe.ReplaceAllString(result, " ")
+	result = strings.TrimSpace(result)
+
+	// 3. 转义 RediSearch 查询语法特殊字符
 	special := []string{
-		"@", "!", "{", "}", "(", ")", "[", "]", "\\", ":", ";",
+		"\\", // 反斜杠必须第一个处理，避免二次转义
+		"@", "!", "{", "}", "(", ")", "[", "]", ":", ";",
 		"~", "&", "*", "$", "^", "-", "+", "=", ">", "<", "|",
+		"'", "`", "\"",
+		"/", ".", ",", "#", "%", "_",
 	}
-	result := query
 	for _, ch := range special {
 		result = strings.ReplaceAll(result, ch, "\\"+ch)
 	}
+
+	// 4. 截断过长查询（HyDE 生成的假想文档可能很长，但 BM25 关键词检索不需要那么多内容）
+	// 截断到 500 字符，按空格边界截断避免截断单词中间
+	const maxBM25QueryLen = 500
+	if len(result) > maxBM25QueryLen {
+		truncated := result[:maxBM25QueryLen]
+		// 尝试在最后一个空格处截断，避免截断到转义序列中间
+		if idx := strings.LastIndex(truncated, " "); idx > maxBM25QueryLen/2 {
+			truncated = truncated[:idx]
+		}
+		result = truncated
+	}
+
+	// 5. 最终保护：如果转义后变为空串，返回一个不会匹配任何内容的安全查询
+	if strings.TrimSpace(result) == "" {
+		return "__empty_query__"
+	}
+
 	return result
 }
 
