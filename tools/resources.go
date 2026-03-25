@@ -24,6 +24,16 @@ func NewRAGResourceProvider(store rag.VectorStore, retCfg *rag.RetrieverConfig) 
 	}
 }
 
+// GetResources 返回空的静态资源列表。
+// 必须实现此方法（即使返回空数组），否则 mcp-go SDK 的 handleListResources
+// 在 resources map 为空时会返回 JSON "resources": null 而非 []，
+// 导致 Cursor 等 MCP 客户端的 JSON Schema 校验报错：
+//
+//	"expected array, received null"
+func (p *RAGResourceProvider) GetResources() []Resource {
+	return []Resource{}
+}
+
 func (p *RAGResourceProvider) GetResourceTemplates() []ResourceTemplate {
 	return []ResourceTemplate{
 		p.documentTemplate(),
