@@ -190,7 +190,13 @@ func (r *MultiFileRetriever) embedTexts(ctx context.Context, texts []string) ([]
 func (r *MultiFileRetriever) Retrieve(ctx context.Context, query string, fileIDs []string) ([]RetrievalResult, error) {
 	// ── 查询预校验：拦截空查询、纯占位符等无意义查询，避免浪费 LLM 调用 ──
 	if !isValidQuery(query) {
-		logrus.Warnf("[RAG Query] Rejected invalid/empty query for user %d: %q", r.userID, query)
+		// 已知的 MCP 客户端探测模式用 Debug 级别，避免刷屏；
+		// 意外的无效查询保留 Warn，方便排查问题
+		if isKnownProbeQuery(query) {
+			logrus.Debugf("[RAG Query] Ignored client probe query for user %d: %q", r.userID, query)
+		} else {
+			logrus.Warnf("[RAG Query] Rejected invalid/empty query for user %d: %q", r.userID, query)
+		}
 		return []RetrievalResult{}, nil
 	}
 
@@ -842,6 +848,20 @@ func generateUserIndexPrefix(template string, userID uint) string {
 //   - 已知的占位符模式："Unknown task"、"Compare  and "、"Unknown question" 等
 //     （这些通常是 MCP 客户端探测/初始化时发送的无意义查询）
 //   - 纯标点/符号
+//
+// isKnownProbeQuery 判断是否为 MCP 客户端（如 Cursor）的已知高频探测查询。
+// 这些查询每隔 1-2 分钟周期性发送，用 Debug 级别记录避免日志刷屏。
+func isKnownProbeQuery(query string) bool {
+	lower := strings.ToLower(strings.TrimSpace(query))
+	switch lower {
+	case "unknown task", "unknown topic", "unknown question":
+		return true
+	}
+	// "Compare  and " 的各种空格变体
+	compareAndRe := regexp.MustCompile(`(?i)^compare\s+and\s*$`)
+	return compareAndRe.MatchString(strings.TrimSpace(query))
+}
+
 func isValidQuery(query string) bool {
 	trimmed := strings.TrimSpace(query)
 	if trimmed == "" {
