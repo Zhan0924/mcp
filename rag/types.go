@@ -26,13 +26,29 @@ import "github.com/google/uuid"
 // 由 Retriever.Search 返回，经 tools 层序列化后作为 MCP JSON 响应的一部分。
 // RelevanceScore 已经过归一化（0~1），分数越高相关性越强。
 type RetrievalResult struct {
-	ChunkID        string  `json:"chunk_id"`
-	ParentChunkID  string  `json:"parent_chunk_id,omitempty"` // 用于 Parent-Child Retriever 的分组去重
-	FileID         string  `json:"file_id"`
-	FileName       string  `json:"file_name"`
-	ChunkIndex     int     `json:"chunk_index"` // 该 chunk 在原始文档中的顺序号，便于上层重建上下文
-	Content        string  `json:"content"`
-	RelevanceScore float64 `json:"relevance_score"` // 归一化相关性得分 [0, 1]
+	ChunkID        string        `json:"chunk_id"`
+	ParentChunkID  string        `json:"parent_chunk_id,omitempty"` // 用于 Parent-Child Retriever 的分组去重
+	FileID         string        `json:"file_id"`
+	FileName       string        `json:"file_name"`
+	ChunkIndex     int           `json:"chunk_index"` // 该 chunk 在原始文档中的顺序号，便于上层重建上下文
+	Content        string        `json:"content"`
+	RelevanceScore float64       `json:"relevance_score"`         // 归一化相关性得分 [0, 1]
+	ScoreDetails   *ScoreDetails `json:"score_details,omitempty"` // 检索分数可解释性明细
+}
+
+// ScoreDetails 检索分数可解释性明细。
+// 各字段仅在对应检索路径生效时有值，使用 omitempty 避免无效零值噪声。
+// Source 字段标识该结果的来源路径，帮助调用方理解排名依据：
+//   - "vector_only"  — 混合检索中仅向量路命中
+//   - "keyword_only" — 混合检索中仅关键词路命中
+//   - "hybrid"       — 同时被向量和关键词搜索召回（RRF 融合加分）
+//   - "graph"        — 来自 Graph RAG 知识图谱
+type ScoreDetails struct {
+	VectorScore  float64 `json:"vector_score,omitempty"`  // 原始向量相似度 (1 - cosine_distance/2)
+	KeywordScore float64 `json:"keyword_score,omitempty"` // BM25 关键词匹配得分
+	RRFScore     float64 `json:"rrf_score,omitempty"`     // RRF 融合后得分
+	RerankScore  float64 `json:"rerank_score,omitempty"`  // Reranker 重排序得分
+	Source       string  `json:"source,omitempty"`        // 来源路径标识
 }
 
 // IndexResult 文档索引操作的汇总报告。

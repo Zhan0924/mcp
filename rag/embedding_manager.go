@@ -274,16 +274,16 @@ func (m *Manager) AddProvider(ctx context.Context, config ProviderConfig) error 
 		return nil
 	}
 
-	// 维度一致性检查：所有启用的 Provider 维度必须相同，否则故障转移时维度变化会导致索引查询失败
+	// 维度一致性检查：所有启用的 Provider 维度必须相同，
+	// 否则故障转移时维度变化会导致索引查询失败和数据损坏（问题 3）
 	if config.Dimension > 0 {
 		m.mu.RLock()
 		for _, p := range m.providers {
 			if p.config.Dimension > 0 && p.config.Dimension != config.Dimension {
 				m.mu.RUnlock()
-				logrus.Warnf("[EmbeddingManager] DIMENSION MISMATCH: provider %s (dim=%d) vs %s (dim=%d). "+
-					"Failover between these providers will cause index query failures!",
+				return fmt.Errorf("DIMENSION MISMATCH: provider %s (dim=%d) vs existing %s (dim=%d). "+
+					"All providers must use the same dimension for safe failover",
 					config.Name, config.Dimension, p.config.Name, p.config.Dimension)
-				break
 			}
 		}
 		m.mu.RUnlock()
@@ -599,7 +599,9 @@ func (m *Manager) healthCheckLoop() {
 	}
 }
 
-// performHealthCheck 对每个 Provider 并发发起探测（各 Provider 互不阻塞）
+// performHealthCheck 只对非健康的 Provider 发起探测（问题 19）。
+// Closed 状态的 Provider 已经在正常服务，无需额外探测。
+// 这样正常运行时零 API 调用，仅在有故障 Provider 时才产生探测开销。
 func (m *Manager) performHealthCheck() {
 	m.mu.RLock()
 	providers := make([]*Provider, len(m.providers))
@@ -607,17 +609,28 @@ func (m *Manager) performHealthCheck() {
 	m.mu.RUnlock()
 
 	for _, p := range providers {
+		p.mu.RLock()
+		state := p.circuitState
+		p.mu.RUnlock()
+
+		// 只对 Open 和 HalfOpen 的 Provider 做健康检查
+		if state == CircuitStateClosed {
+			continue
+		}
+
 		go m.checkProviderHealth(p)
 	}
 }
 
-// checkProviderHealth 发送轻量 probe 请求，根据结果更新熔断器
-// 健康检查成功可直接将 Open → Closed，绕过 HalfOpen 阶段（因为是主动探测而非用户请求）
+// checkProviderHealth 发送轻量 probe 请求，根据结果更新熔断器。
+// 使用最短文本做探测，减少 API 调用成本（问题 19）。
+// 健康检查成功可直接将 Open → Closed，绕过 HalfOpen 阶段。
 func (m *Manager) checkProviderHealth(provider *Provider) {
 	ctx, cancel := context.WithTimeout(m.ctx, m.config.HealthCheckTimeout)
 	defer cancel()
 
-	_, err := provider.embedder.EmbedStrings(ctx, []string{"health check"})
+	// 使用单个空格作为最短输入，大多数 Embedding API 都能接受
+	_, err := provider.embedder.EmbedStrings(ctx, []string{" "})
 
 	provider.mu.Lock()
 	defer provider.mu.Unlock()

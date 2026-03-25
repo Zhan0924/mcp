@@ -26,6 +26,9 @@ package rag
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -61,14 +64,16 @@ type IndexTask struct {
 
 // TaskQueueConfig 任务队列配置
 type TaskQueueConfig struct {
-	Enabled      bool          `toml:"enabled"`
-	StreamKey    string        `toml:"stream_key"`
-	GroupName    string        `toml:"group_name"`
-	StatusPrefix string        `toml:"status_prefix"`
-	WorkerCount  int           `toml:"worker_count"`
-	TaskTTL      time.Duration `toml:"task_ttl"`
-	ClaimTimeout time.Duration `toml:"claim_timeout"`
-	WebhookURL   string        `toml:"webhook_url"` // 任务完成/失败后的回调 URL（可选）
+	Enabled         bool          `toml:"enabled"`
+	StreamKey       string        `toml:"stream_key"`
+	GroupName       string        `toml:"group_name"`
+	StatusPrefix    string        `toml:"status_prefix"`
+	WorkerCount     int           `toml:"worker_count"`
+	TaskTTL         time.Duration `toml:"task_ttl"`
+	ClaimTimeout    time.Duration `toml:"claim_timeout"`
+	WebhookURL      string        `toml:"webhook_url"`       // 任务完成/失败后的回调 URL（可选）
+	WebhookSecret   string        `toml:"webhook_secret"`    // HMAC-SHA256 签名密钥，接收方可验证请求合法性
+	WebhookMaxRetry int           `toml:"webhook_max_retry"` // 最大重试次数，默认 3
 }
 
 // DefaultTaskQueueConfig 默认配置
@@ -86,13 +91,15 @@ func DefaultTaskQueueConfig() TaskQueueConfig {
 
 // TaskQueue Redis Streams 任务队列
 type TaskQueue struct {
-	redis        redisCli.UniversalClient
-	streamKey    string
-	groupName    string
-	statusPrefix string
-	taskTTL      time.Duration
-	claimTimeout time.Duration
-	webhookURL   string // Webhook 回调 URL
+	redis           redisCli.UniversalClient
+	streamKey       string
+	groupName       string
+	statusPrefix    string
+	taskTTL         time.Duration
+	claimTimeout    time.Duration
+	webhookURL      string // Webhook 回调 URL
+	webhookSecret   string // HMAC 签名密钥
+	webhookMaxRetry int    // 最大重试次数
 }
 
 // NewTaskQueue 创建任务队列
@@ -117,14 +124,20 @@ func NewTaskQueue(redis redisCli.UniversalClient, cfg TaskQueueConfig) *TaskQueu
 	if claimTimeout == 0 {
 		claimTimeout = 5 * time.Minute
 	}
+	webhookMaxRetry := cfg.WebhookMaxRetry
+	if webhookMaxRetry <= 0 {
+		webhookMaxRetry = 3
+	}
 	return &TaskQueue{
-		redis:        redis,
-		streamKey:    streamKey,
-		groupName:    groupName,
-		statusPrefix: statusPrefix,
-		taskTTL:      taskTTL,
-		claimTimeout: claimTimeout,
-		webhookURL:   cfg.WebhookURL,
+		redis:           redis,
+		streamKey:       streamKey,
+		groupName:       groupName,
+		statusPrefix:    statusPrefix,
+		taskTTL:         taskTTL,
+		claimTimeout:    claimTimeout,
+		webhookURL:      cfg.WebhookURL,
+		webhookSecret:   cfg.WebhookSecret,
+		webhookMaxRetry: webhookMaxRetry,
 	}
 }
 
@@ -341,8 +354,9 @@ func searchSubstring(s, substr string) bool {
 
 // --- Webhook 回调通知 ---
 
-// NotifyWebhook 在任务完成或失败时发送 Webhook 回调通知
-// 采用 fire-and-forget 策略：回调失败不影响任务状态，仅记录日志
+// NotifyWebhook 在任务完成或失败时发送 Webhook 回调通知。
+// 支持 HMAC-SHA256 签名验证和指数退避重试（问题 12）。
+// 4xx 客户端错误不重试，5xx 服务端错误重试。
 func (q *TaskQueue) NotifyWebhook(task *IndexTask) {
 	if q.webhookURL == "" {
 		return
@@ -366,17 +380,61 @@ func (q *TaskQueue) NotifyWebhook(task *IndexTask) {
 		}
 
 		client := &http.Client{Timeout: 10 * time.Second}
-		resp, err := client.Post(q.webhookURL, "application/json", bytes.NewReader(payload))
-		if err != nil {
-			logrus.Warnf("[TaskQueue] Webhook call failed for task %s: %v", task.TaskID, err)
-			return
-		}
-		defer resp.Body.Close()
 
-		if resp.StatusCode >= 400 {
-			logrus.Warnf("[TaskQueue] Webhook returned HTTP %d for task %s", resp.StatusCode, task.TaskID)
-		} else {
-			logrus.Infof("[TaskQueue] Webhook notified for task %s (status=%s)", task.TaskID, task.Status)
+		for attempt := 0; attempt <= q.webhookMaxRetry; attempt++ {
+			if attempt > 0 {
+				// 指数退避: 1s, 2s, 4s
+				delay := time.Duration(1<<uint(attempt-1)) * time.Second
+				time.Sleep(delay)
+				logrus.Infof("[TaskQueue] Webhook retry %d/%d for task %s",
+					attempt, q.webhookMaxRetry, task.TaskID)
+			}
+
+			req, reqErr := http.NewRequest(http.MethodPost, q.webhookURL, bytes.NewReader(payload))
+			if reqErr != nil {
+				logrus.Warnf("[TaskQueue] Webhook request creation failed: %v", reqErr)
+				return
+			}
+
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Webhook-Event", "task_"+task.Status)
+			req.Header.Set("X-Webhook-Delivery", task.TaskID)
+
+			// HMAC-SHA256 签名：接收方可用同一密钥验证请求合法性
+			if q.webhookSecret != "" {
+				mac := hmac.New(sha256.New, []byte(q.webhookSecret))
+				mac.Write(payload)
+				signature := hex.EncodeToString(mac.Sum(nil))
+				req.Header.Set("X-Webhook-Signature", "sha256="+signature)
+			}
+
+			resp, doErr := client.Do(req)
+			if doErr != nil {
+				logrus.Warnf("[TaskQueue] Webhook call failed (attempt %d): %v",
+					attempt+1, doErr)
+				continue // 重试
+			}
+			resp.Body.Close()
+
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				logrus.Infof("[TaskQueue] Webhook notified for task %s (status=%s)",
+					task.TaskID, task.Status)
+				return // 成功，退出
+			}
+
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+				// 4xx 客户端错误不重试（如 401/404/422 等）
+				logrus.Warnf("[TaskQueue] Webhook returned %d (client error, no retry) for task %s",
+					resp.StatusCode, task.TaskID)
+				return
+			}
+
+			// 5xx 服务端错误，继续重试
+			logrus.Warnf("[TaskQueue] Webhook returned %d (attempt %d), will retry",
+				resp.StatusCode, attempt+1)
 		}
+
+		logrus.Errorf("[TaskQueue] Webhook exhausted all %d retries for task %s",
+			q.webhookMaxRetry+1, task.TaskID)
 	}()
 }

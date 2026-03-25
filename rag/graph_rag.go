@@ -35,9 +35,9 @@ import (
 
 // Entity 知识图谱中的实体节点
 type Entity struct {
-	Name       string            `json:"name"`       // 实体名称
-	Type       string            `json:"type"`       // 实体类型（如 Person, Function, Class, Concept）
-	Properties map[string]string `json:"properties"` // 额外属性
+	Name       string            `json:"name"`        // 实体名称
+	Type       string            `json:"type"`        // 实体类型（如 Person, Function, Class, Concept）
+	Properties map[string]string `json:"properties"`  // 额外属性
 	SourceFile string            `json:"source_file"` // 来源文件 ID
 }
 
@@ -52,9 +52,9 @@ type Relation struct {
 
 // GraphSearchResult 图谱子图检索结果
 type GraphSearchResult struct {
-	Entities   []Entity   `json:"entities"`
-	Relations  []Relation `json:"relations"`
-	ContextText string   `json:"context_text"` // 从子图提取的自然语言上下文
+	Entities    []Entity   `json:"entities"`
+	Relations   []Relation `json:"relations"`
+	ContextText string     `json:"context_text"` // 从子图提取的自然语言上下文
 }
 
 // GraphStore 图存储接口
@@ -84,32 +84,63 @@ type EntityExtractor interface {
 
 // InMemoryGraphStore 基于内存的图存储，用于开发和测试
 // 并发安全：所有读写操作均受 RWMutex 保护
+// entityIndex 和 relationIndex 用于去重，防止重复索引同一文档时图谱膨胀
 type InMemoryGraphStore struct {
-	entities  []Entity
-	relations []Relation
-	mu        sync.RWMutex
+	entities      []Entity
+	relations     []Relation
+	entityIndex   map[string]bool // key: "name|type|sourceFile" → 实体去重
+	relationIndex map[string]bool // key: "source|type|target|sourceFile" → 关系去重
+	mu            sync.RWMutex
 }
 
 func NewInMemoryGraphStore() *InMemoryGraphStore {
 	return &InMemoryGraphStore{
-		entities:  make([]Entity, 0),
-		relations: make([]Relation, 0),
+		entities:      make([]Entity, 0),
+		relations:     make([]Relation, 0),
+		entityIndex:   make(map[string]bool),
+		relationIndex: make(map[string]bool),
 	}
+}
+
+func entityDedupeKey(e Entity) string {
+	return e.Name + "|" + e.Type + "|" + e.SourceFile
+}
+
+func relationDedupeKey(r Relation) string {
+	return r.Source + "|" + r.Type + "|" + r.Target + "|" + r.SourceFile
 }
 
 func (s *InMemoryGraphStore) AddEntities(ctx context.Context, entities []Entity) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.entities = append(s.entities, entities...)
-	logrus.Infof("[GraphRAG] Added %d entities, total: %d", len(entities), len(s.entities))
+	added := 0
+	for _, e := range entities {
+		key := entityDedupeKey(e)
+		if !s.entityIndex[key] {
+			s.entityIndex[key] = true
+			s.entities = append(s.entities, e)
+			added++
+		}
+	}
+	logrus.Infof("[GraphRAG] Added %d new entities (skipped %d duplicates), total: %d",
+		added, len(entities)-added, len(s.entities))
 	return nil
 }
 
 func (s *InMemoryGraphStore) AddRelations(ctx context.Context, relations []Relation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.relations = append(s.relations, relations...)
-	logrus.Infof("[GraphRAG] Added %d relations, total: %d", len(relations), len(s.relations))
+	added := 0
+	for _, r := range relations {
+		key := relationDedupeKey(r)
+		if !s.relationIndex[key] {
+			s.relationIndex[key] = true
+			s.relations = append(s.relations, r)
+			added++
+		}
+	}
+	logrus.Infof("[GraphRAG] Added %d new relations (skipped %d duplicates), total: %d",
+		added, len(relations)-added, len(s.relations))
 	return nil
 }
 
@@ -190,6 +221,12 @@ func (s *InMemoryGraphStore) DeleteByFileID(ctx context.Context, fileID string) 
 	removed := len(s.entities) - len(filteredEntities)
 	s.entities = filteredEntities
 
+	// 重建 entityIndex
+	s.entityIndex = make(map[string]bool, len(s.entities))
+	for _, e := range s.entities {
+		s.entityIndex[entityDedupeKey(e)] = true
+	}
+
 	// 过滤掉该文件的关系
 	var filteredRelations []Relation
 	for _, r := range s.relations {
@@ -198,6 +235,12 @@ func (s *InMemoryGraphStore) DeleteByFileID(ctx context.Context, fileID string) 
 		}
 	}
 	s.relations = filteredRelations
+
+	// 重建 relationIndex
+	s.relationIndex = make(map[string]bool, len(s.relations))
+	for _, r := range s.relations {
+		s.relationIndex[relationDedupeKey(r)] = true
+	}
 
 	logrus.Infof("[GraphRAG] Deleted %d entities for file: %s", removed, fileID)
 	return nil

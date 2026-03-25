@@ -426,6 +426,12 @@ var (
 func InitGlobalCache(config CacheConfig, redisClient redisCli.UniversalClient) *EmbeddingCache {
 	globalCacheMu.Lock()
 	defer globalCacheMu.Unlock()
+
+	// 停止旧 cache 的后台清理协程，防止 goroutine 泄漏（问题 6）
+	if globalCache != nil {
+		globalCache.local.Stop()
+	}
+
 	globalCache = NewEmbeddingCache(config, redisClient)
 	logrus.Infof("[EmbeddingCache] Global cache initialized (local_max=%d, ttl=%v, redis=%v, dedup=%v)",
 		config.LocalMaxSize, config.LocalTTL, config.RedisEnabled, config.DeduplicateOn)

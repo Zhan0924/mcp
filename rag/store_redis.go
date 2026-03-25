@@ -141,6 +141,7 @@ type IndexConfig struct {
 	Dimension       int            // 向量维度（必须与 Embedding 模型输出维度一致）
 	Algorithm       IndexAlgorithm // 索引算法：FLAT 或 HNSW
 	HNSWParams      *HNSWParams    // HNSW 算法专用参数（仅 Algorithm=HNSW 时生效）
+	Language        string         // 全文搜索语言: "chinese" / "english" / "" (默认)
 }
 
 // IndexAlgorithm 索引算法枚举类型
@@ -203,13 +204,14 @@ type VectorEntry struct {
 
 // VectorQuery 向量搜索请求参数
 type VectorQuery struct {
-	IndexName       string   // 目标索引名称
-	Vector          []byte   // 查询向量（Little-Endian float32 字节序列，由 Float32SliceToBytes 生成）
-	TopK            int      // 返回最相似的 K 个结果
-	VectorFieldName string   // 向量字段名（默认 "vector"）
-	ReturnFields    []string // 需要返回的字段列表
-	SearchDialect   int      // Redis 搜索方言版本（需 >= 2 才支持向量搜索语法）
-	FilterQuery     string   // 前置过滤条件（RediSearch 查询语法，如 "@file_id:{xxx}"）
+	IndexName       string            // 目标索引名称
+	Vector          []byte            // 查询向量（Little-Endian float32 字节序列，由 Float32SliceToBytes 生成）
+	TopK            int               // 返回最相似的 K 个结果
+	VectorFieldName string            // 向量字段名（默认 "vector"）
+	ReturnFields    []string          // 需要返回的字段列表
+	SearchDialect   int               // Redis 搜索方言版本（需 >= 2 才支持向量搜索语法）
+	FilterQuery     string            // 前置过滤条件（Redis 原生语法，向后兼容）
+	Filters         []FilterCondition // 抽象过滤条件（Milvus/Qdrant 优先使用，Redis 使用 FilterQuery）
 }
 
 // HybridQuery 混合搜索请求参数
@@ -295,14 +297,22 @@ func (s *RedisVectorStore) EnsureIndex(ctx context.Context, config IndexConfig) 
 		"FT.CREATE", config.IndexName,
 		"ON", "HASH",
 		"PREFIX", "1", config.Prefix,
-		"SCHEMA",
+	}
+
+	// 全文搜索语言配置：影响 BM25 分词器行为
+	// "chinese" 启用中文分词，否则默认英文分词
+	if config.Language != "" {
+		createArgs = append(createArgs, "LANGUAGE", config.Language)
+	}
+
+	createArgs = append(createArgs, "SCHEMA",
 		"content", "TEXT", "WEIGHT", "1.0",
 		"file_id", "TAG",
 		"file_name", "TEXT", "NOINDEX",
 		"chunk_id", "TAG",
 		"chunk_index", "NUMERIC",
 		"parent_chunk_id", "TAG",
-	}
+	)
 
 	switch algorithm {
 	case IndexAlgorithmHNSW:
@@ -619,29 +629,43 @@ func (s *RedisVectorStore) DeleteByFileID(ctx context.Context, indexName, prefix
 	return totalDeleted, nil
 }
 
-// GetDocumentChunks 按 file_id 获取文档的所有分块内容，按 chunk_index 升序排列
+// GetDocumentChunks 按 file_id 获取文档的所有分块内容，按 chunk_index 升序排列。
+// 使用分页循环避免硬编码上限，支持超大文档。
 func (s *RedisVectorStore) GetDocumentChunks(ctx context.Context, indexName, prefix, fileID string) ([]string, error) {
 	escapedID := escapeTagValue(fileID)
 	searchQuery := fmt.Sprintf("@file_id:{%s}", escapedID)
 
-	// SORTBY chunk_index ASC 保证分块顺序与原文一致
-	// LIMIT 0 10000 假设一个文件最多 10000 块
-	result, err := s.client.Do(ctx, "FT.SEARCH", indexName, searchQuery,
-		"RETURN", "1", "content", "SORTBY", "chunk_index", "ASC", "LIMIT", "0", "10000").Result()
-	if err != nil {
-		if strings.Contains(err.Error(), "Unknown index name") {
-			return nil, nil
+	const pageSize = 1000
+	var allResults []VectorSearchResult
+
+	for offset := 0; ; offset += pageSize {
+		result, err := s.client.Do(ctx, "FT.SEARCH", indexName, searchQuery,
+			"RETURN", "2", "content", "chunk_index",
+			"SORTBY", "chunk_index", "ASC",
+			"LIMIT", fmt.Sprintf("%d", offset), fmt.Sprintf("%d", pageSize),
+		).Result()
+		if err != nil {
+			if strings.Contains(err.Error(), "Unknown index name") {
+				return nil, nil
+			}
+			return nil, NewRAGError(ErrCodeSearchFailed, "get chunks for "+fileID, err)
 		}
-		return nil, NewRAGError(ErrCodeSearchFailed, "get chunks for "+fileID, err)
+
+		pageResults, err := parseRawSearchResult(result)
+		if err != nil {
+			return nil, err
+		}
+
+		allResults = append(allResults, pageResults...)
+
+		// 本页不满说明已到末尾
+		if len(pageResults) < pageSize {
+			break
+		}
 	}
 
-	searchResults, err := parseRawSearchResult(result)
-	if err != nil {
-		return nil, err
-	}
-
-	chunks := make([]string, 0, len(searchResults))
-	for _, res := range searchResults {
+	chunks := make([]string, 0, len(allResults))
+	for _, res := range allResults {
 		if content, ok := res.Fields["content"]; ok {
 			chunks = append(chunks, content)
 		}
@@ -840,8 +864,10 @@ func mergeByRRF(vectorResults, textResults []VectorSearchResult, vectorWeight, k
 	}
 
 	type scored struct {
-		result VectorSearchResult
-		score  float64
+		result    VectorSearchResult
+		score     float64
+		inVector  bool // 是否在向量搜索结果中
+		inKeyword bool // 是否在关键词搜索结果中
 	}
 
 	scoreMap := make(map[string]*scored)
@@ -853,7 +879,7 @@ func mergeByRRF(vectorResults, textResults []VectorSearchResult, vectorWeight, k
 		if key == "" {
 			key = fmt.Sprintf("vec_%d", rank)
 		}
-		scoreMap[key] = &scored{result: r, score: rrfScore}
+		scoreMap[key] = &scored{result: r, score: rrfScore, inVector: true}
 	}
 
 	// 计算关键词搜索结果的 RRF 分数并累加（同一文档出现在两路中则分数叠加）
@@ -866,14 +892,24 @@ func mergeByRRF(vectorResults, textResults []VectorSearchResult, vectorWeight, k
 		if existing, ok := scoreMap[key]; ok {
 			// 同一文档同时被向量和关键词命中，分数累加 → 排名提升
 			existing.score += rrfScore
+			existing.inKeyword = true
 		} else {
-			scoreMap[key] = &scored{result: r, score: rrfScore}
+			scoreMap[key] = &scored{result: r, score: rrfScore, inKeyword: true}
 		}
 	}
 
 	results := make([]VectorSearchResult, 0, len(scoreMap))
 	for _, s := range scoreMap {
 		s.result.Score = s.score
+		// 附带分数明细供上层 convertVectorResults 提取（问题 15：可解释性）
+		source := "hybrid"
+		if s.inVector && !s.inKeyword {
+			source = "vector_only"
+		} else if !s.inVector && s.inKeyword {
+			source = "keyword_only"
+		}
+		s.result.Fields["__score_source"] = source
+		s.result.Fields["__rrf_score"] = fmt.Sprintf("%f", s.score)
 		results = append(results, s.result)
 	}
 
@@ -1055,4 +1091,31 @@ func Float32SliceToBytes(floats []float32) []byte {
 		bytes[i*4+3] = byte(bits >> 24)
 	}
 	return bytes
+}
+
+// BuildRedisFilter 将抽象 FilterCondition 切片转为 RediSearch 查询语法。
+// 这是 Redis 后端专用的转换函数，Milvus 和 Qdrant 各有对应的实现。
+func BuildRedisFilter(filters []FilterCondition) string {
+	if len(filters) == 0 {
+		return "*"
+	}
+	var parts []string
+	for _, f := range filters {
+		switch f.Op {
+		case FilterOpIn:
+			escaped := make([]string, len(f.Values))
+			for i, v := range f.Values {
+				escaped[i] = escapeTagValue(v)
+			}
+			parts = append(parts, fmt.Sprintf("@%s:{%s}", f.Field, strings.Join(escaped, "|")))
+		case FilterOpEqual:
+			if len(f.Values) > 0 {
+				parts = append(parts, fmt.Sprintf("@%s:{%s}", f.Field, escapeTagValue(f.Values[0])))
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return "*"
+	}
+	return strings.Join(parts, " ")
 }

@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -313,6 +314,11 @@ func buildRerankedResults[T any](apiResults []T, origDocs []RetrievalResult, top
 			continue
 		}
 		doc := origDocs[item.index]
+		// 保留 Rerank 分数到 ScoreDetails（问题 15：可解释性）
+		if doc.ScoreDetails == nil {
+			doc.ScoreDetails = &ScoreDetails{}
+		}
+		doc.ScoreDetails.RerankScore = item.score
 		doc.RelevanceScore = item.score
 		reranked = append(reranked, doc)
 		if len(reranked) >= topN {
@@ -474,10 +480,16 @@ func (r *ScoreReranker) Rerank(_ context.Context, _ string, documents []Retrieva
 // 全局 Reranker 管理
 // ================================================================
 
-var globalReranker Reranker
+var (
+	globalReranker   Reranker
+	globalRerankerMu sync.RWMutex
+)
 
 // InitGlobalReranker 初始化全局 Reranker
 func InitGlobalReranker(config RerankConfig) Reranker {
+	globalRerankerMu.Lock()
+	defer globalRerankerMu.Unlock()
+
 	if !config.Enabled {
 		// 禁用时回退到纯分数排序，保证结果可用且不依赖外部 API
 		logrus.Info("[Reranker] Reranker disabled, using score-based fallback")
@@ -505,6 +517,9 @@ func InitGlobalReranker(config RerankConfig) Reranker {
 
 // GetGlobalReranker 获取全局 Reranker
 func GetGlobalReranker() Reranker {
+	globalRerankerMu.RLock()
+	defer globalRerankerMu.RUnlock()
+
 	if globalReranker == nil {
 		return NewScoreReranker()
 	}

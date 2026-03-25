@@ -132,7 +132,32 @@ type RetrieverConfig struct {
 	// ---- 上下文压缩 (Context Compression) ----
 	CompressorEnabled bool              // 是否启用上下文压缩
 	CompressorConfig  *CompressorConfig // 压缩器配置
+
+	// ---- 全文搜索语言 ----
+	// 影响 Redis FT.CREATE 的 LANGUAGE 参数，控制 BM25 分词器行为。
+	// "chinese" 使用中文分词器，"" 使用默认英文分词器。
+	// 注意：此配置仅在 Redis 后端创建新索引时生效，已有索引不受影响。
+	SearchLanguage string `toml:"search_language"`
 }
+
+// FilterCondition 抽象过滤条件，不绑定特定 VectorStore 后端语法。
+// 由 Retriever 层构造，各 VectorStore 实现自行转为本地语法：
+//   - Redis:  @file_id:{v1|v2}
+//   - Milvus: file_id in ["v1", "v2"]
+//   - Qdrant: {"must": [{"key": "file_id", "match": {"value": "v1"}}]}
+type FilterCondition struct {
+	Field  string   // 字段名 (如 "file_id")
+	Op     FilterOp // 操作符
+	Values []string // 值列表
+}
+
+// FilterOp 过滤操作符枚举
+type FilterOp string
+
+const (
+	FilterOpIn    FilterOp = "in"    // field IN (v1, v2, ...)
+	FilterOpEqual FilterOp = "equal" // field == v
+)
 
 // ChunkingConfig 文档分块配置
 //
@@ -180,6 +205,7 @@ func DefaultRetrieverConfig() *RetrieverConfig {
 		HyDEEnabled:             false, // 默认关闭查询扩展，因其需要额外的 LLM 调用开销
 		MultiQueryEnabled:       false, // 默认关闭多查询检索
 		CompressorEnabled:       false, // 默认关闭上下文压缩
+		SearchLanguage:          "",    // 默认使用英文分词器；中文场景设为 "chinese"
 	}
 }
 

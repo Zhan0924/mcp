@@ -106,6 +106,13 @@ func main() {
 		// consumer 名称 = instanceID-PID，确保多实例多进程下全局唯一
 		consumer := fmt.Sprintf("%s-%d", cfg.Server.InstanceID, os.Getpid())
 		indexWorker = rag.NewIndexWorker(taskQueue, store, retCfg, chunkCfg, consumer, asyncCfg.WorkerCount)
+
+		// 将 GraphRAG 依赖注入到 Worker，使异步索引完成后自动提取实体（问题 5）
+		if graphStore != nil && entityExtractor != nil {
+			indexWorker.SetGraphRAG(graphStore, entityExtractor)
+			logrus.Info("异步索引 Worker 已集成 Graph RAG 实体提取")
+		}
+
 		if err := indexWorker.Start(); err != nil {
 			logrus.Fatalf("异步索引 Worker 启动失败: %v", err)
 		}

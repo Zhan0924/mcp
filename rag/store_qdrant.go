@@ -160,6 +160,14 @@ func (s *QdrantVectorStore) EnsureIndex(ctx context.Context, config IndexConfig)
 	_, _ = s.doQdrantRequest(ctx, "PUT",
 		fmt.Sprintf("/collections/%s/index", collectionName), indexBody)
 
+	// 创建 content 全文索引，支持混合检索中的关键词搜索（问题 1）
+	contentIndexBody := map[string]interface{}{
+		"field_name":   "content",
+		"field_schema": "text",
+	}
+	_, _ = s.doQdrantRequest(ctx, "PUT",
+		fmt.Sprintf("/collections/%s/index", collectionName), contentIndexBody)
+
 	logrus.Infof("[QdrantStore] Created collection %s (dim=%d)", collectionName, config.Dimension)
 	return nil
 }
@@ -228,13 +236,18 @@ func (s *QdrantVectorStore) SearchVectors(ctx context.Context, query VectorQuery
 	queryVector := bytesToFloat32Slice(query.Vector)
 
 	searchBody := map[string]interface{}{
-		"vector":      queryVector,
-		"limit":       query.TopK,
+		"vector":       queryVector,
+		"limit":        query.TopK,
 		"with_payload": true,
 	}
 
-	// 构造过滤条件
-	filter := buildQdrantFilter(query.FilterQuery)
+	// 构造过滤条件：优先使用抽象 Filters，降级使用 FilterQuery（问题 11）
+	var filter map[string]interface{}
+	if len(query.Filters) > 0 {
+		filter = buildQdrantFilterFromConditions(query.Filters)
+	} else {
+		filter = buildQdrantFilter(query.FilterQuery)
+	}
 	if filter != nil {
 		searchBody["filter"] = filter
 	}
@@ -249,99 +262,197 @@ func (s *QdrantVectorStore) SearchVectors(ctx context.Context, query VectorQuery
 }
 
 // HybridSearch 混合搜索
-// Qdrant 原生支持稀疏+密集向量联合搜索，此处简化为向量搜索 + 客户端关键词过滤
+// 双路检索 + RRF 融合：向量搜索 + Qdrant 全文匹配过滤
 func (s *QdrantVectorStore) HybridSearch(ctx context.Context, query HybridQuery) ([]VectorSearchResult, error) {
-	// 先做向量搜索
+	// 第 1 路: 向量搜索
 	vectorResults, err := s.SearchVectors(ctx, query.VectorQuery)
 	if err != nil {
 		return nil, err
 	}
-
 	if query.TextQuery == "" {
 		return vectorResults, nil
 	}
 
-	// 客户端侧关键词过滤+增权
-	keywords := strings.Fields(strings.ToLower(query.TextQuery))
-	for i := range vectorResults {
-		content := strings.ToLower(vectorResults[i].Fields["content"])
-		matchCount := 0
-		for _, kw := range keywords {
-			if strings.Contains(content, kw) {
-				matchCount++
-			}
-		}
-		if matchCount > 0 {
-			// 关键词命中的结果增加分数
-			bonus := float64(matchCount) / float64(len(keywords)) * query.KeywordWeight
-			vectorResults[i].Score += bonus
-		}
+	// 第 2 路: 使用 Qdrant 的 full-text match 做关键词召回
+	collectionName := sanitizeCollectionName(query.IndexName)
+	keywords := strings.Fields(query.TextQuery)
+	if len(keywords) == 0 {
+		return vectorResults, nil
 	}
 
-	return vectorResults, nil
-}
+	// 构建 content 字段的 should (OR) 全文匹配条件
+	var matchConditions []map[string]interface{}
+	for _, kw := range keywords {
+		matchConditions = append(matchConditions, map[string]interface{}{
+			"key":   "content",
+			"match": map[string]interface{}{"text": kw},
+		})
+	}
 
-// DeleteByFileID 按 file_id 删除
-func (s *QdrantVectorStore) DeleteByFileID(ctx context.Context, indexName, prefix, fileID string) (int64, error) {
-	collectionName := sanitizeCollectionName(indexName)
+	scrollFilter := map[string]interface{}{
+		"should": matchConditions,
+	}
 
-	body := map[string]interface{}{
-		"filter": map[string]interface{}{
-			"must": []map[string]interface{}{
-				{
-					"key":   "file_id",
-					"match": map[string]interface{}{"value": fileID},
-				},
+	// 如果有文件过滤, 包装到 must 中
+	var fileFilter map[string]interface{}
+	if len(query.Filters) > 0 {
+		fileFilter = buildQdrantFilterFromConditions(query.Filters)
+	} else {
+		fileFilter = buildQdrantFilter(query.FilterQuery)
+	}
+	if fileFilter != nil {
+		scrollFilter = map[string]interface{}{
+			"must": []interface{}{
+				fileFilter,
+				map[string]interface{}{"should": matchConditions},
 			},
-		},
+		}
 	}
 
-	_, err := s.doQdrantRequest(ctx, "POST",
-		fmt.Sprintf("/collections/%s/points/delete", collectionName), body)
-	if err != nil {
-		return 0, fmt.Errorf("delete by file_id: %w", err)
-	}
-	return 0, nil
-}
-
-// GetDocumentChunks 获取文档分块
-func (s *QdrantVectorStore) GetDocumentChunks(ctx context.Context, indexName, prefix, fileID string) ([]string, error) {
-	collectionName := sanitizeCollectionName(indexName)
-
-	body := map[string]interface{}{
-		"filter": map[string]interface{}{
-			"must": []map[string]interface{}{
-				{
-					"key":   "file_id",
-					"match": map[string]interface{}{"value": fileID},
-				},
-			},
-		},
-		"limit":        10000,
+	expandedTopK := query.TopK * 3
+	scrollBody := map[string]interface{}{
+		"filter":       scrollFilter,
+		"limit":        expandedTopK,
 		"with_payload": true,
 	}
 
-	result, err := s.doQdrantRequest(ctx, "POST",
-		fmt.Sprintf("/collections/%s/points/scroll", collectionName), body)
-	if err != nil {
-		return nil, err
+	scrollResult, err := s.doQdrantRequest(ctx, "POST",
+		fmt.Sprintf("/collections/%s/points/scroll", collectionName), scrollBody)
+	var textResults []VectorSearchResult
+	if err == nil {
+		textResults = parseQdrantScrollAsSearchResult(scrollResult)
+	} else {
+		logrus.Warnf("[QdrantStore] Text scroll failed, falling back to vector-only: %v", err)
+		return vectorResults, nil
 	}
 
-	var chunks []string
-	if resultData, ok := result["result"].(map[string]interface{}); ok {
-		if points, ok := resultData["points"].([]interface{}); ok {
-			for _, p := range points {
-				if point, ok := p.(map[string]interface{}); ok {
-					if payload, ok := point["payload"].(map[string]interface{}); ok {
-						if content, ok := payload["content"].(string); ok {
-							chunks = append(chunks, content)
+	return mergeByRRF(vectorResults, textResults, query.VectorWeight, query.KeywordWeight, query.TopK), nil
+}
+
+// parseQdrantScrollAsSearchResult 将 scroll 结果转为 VectorSearchResult 以复用 RRF
+func parseQdrantScrollAsSearchResult(result map[string]interface{}) []VectorSearchResult {
+	var results []VectorSearchResult
+	resultData, ok := result["result"].(map[string]interface{})
+	if !ok {
+		return results
+	}
+	points, ok := resultData["points"].([]interface{})
+	if !ok {
+		return results
+	}
+	for _, p := range points {
+		point, ok := p.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		vsr := VectorSearchResult{Fields: make(map[string]string)}
+		if id, ok := point["id"].(string); ok {
+			vsr.Key = id
+		}
+		if payload, ok := point["payload"].(map[string]interface{}); ok {
+			for k, v := range payload {
+				vsr.Fields[k] = fmt.Sprintf("%v", v)
+			}
+		}
+		results = append(results, vsr)
+	}
+	return results
+}
+
+// DeleteByFileID 按 file_id 删除，先计数再删除
+func (s *QdrantVectorStore) DeleteByFileID(ctx context.Context, indexName, prefix, fileID string) (int64, error) {
+	collectionName := sanitizeCollectionName(indexName)
+
+	filterObj := map[string]interface{}{
+		"must": []map[string]interface{}{
+			{"key": "file_id", "match": map[string]interface{}{"value": fileID}},
+		},
+	}
+
+	// 先 count：scroll 仅拿 id 计数
+	countBody := map[string]interface{}{
+		"filter":       filterObj,
+		"limit":        10000,
+		"with_payload": false,
+		"with_vector":  false,
+	}
+	var deletedCount int64
+	countResult, err := s.doQdrantRequest(ctx, "POST",
+		fmt.Sprintf("/collections/%s/points/scroll", collectionName), countBody)
+	if err == nil {
+		if resultData, ok := countResult["result"].(map[string]interface{}); ok {
+			if points, ok := resultData["points"].([]interface{}); ok {
+				deletedCount = int64(len(points))
+			}
+		}
+	}
+
+	// 执行删除
+	deleteBody := map[string]interface{}{"filter": filterObj}
+	_, err = s.doQdrantRequest(ctx, "POST",
+		fmt.Sprintf("/collections/%s/points/delete", collectionName), deleteBody)
+	if err != nil {
+		return 0, fmt.Errorf("delete by file_id: %w", err)
+	}
+
+	logrus.Infof("[QdrantStore] Deleted ~%d points for file_id=%s", deletedCount, fileID)
+	return deletedCount, nil
+}
+
+// GetDocumentChunks 获取文档分块（分页查询，避免硬编码上限）
+func (s *QdrantVectorStore) GetDocumentChunks(ctx context.Context, indexName, prefix, fileID string) ([]string, error) {
+	collectionName := sanitizeCollectionName(indexName)
+
+	const pageSize = 1000
+	var allChunks []string
+	var nextPageOffset interface{}
+
+	for {
+		body := map[string]interface{}{
+			"filter": map[string]interface{}{
+				"must": []map[string]interface{}{
+					{"key": "file_id", "match": map[string]interface{}{"value": fileID}},
+				},
+			},
+			"limit":        pageSize,
+			"with_payload": true,
+		}
+		if nextPageOffset != nil {
+			body["offset"] = nextPageOffset
+		}
+
+		result, err := s.doQdrantRequest(ctx, "POST",
+			fmt.Sprintf("/collections/%s/points/scroll", collectionName), body)
+		if err != nil {
+			if len(allChunks) > 0 {
+				break
+			}
+			return nil, err
+		}
+
+		pageCount := 0
+		if resultData, ok := result["result"].(map[string]interface{}); ok {
+			if points, ok := resultData["points"].([]interface{}); ok {
+				for _, p := range points {
+					if point, ok := p.(map[string]interface{}); ok {
+						if payload, ok := point["payload"].(map[string]interface{}); ok {
+							if content, ok := payload["content"].(string); ok {
+								allChunks = append(allChunks, content)
+								pageCount++
+							}
 						}
 					}
 				}
 			}
+			nextPageOffset = resultData["next_page_offset"]
+		}
+
+		if pageCount < pageSize || nextPageOffset == nil {
+			break
 		}
 	}
-	return chunks, nil
+
+	return allChunks, nil
 }
 
 // ListDocuments 列出所有文档
@@ -488,4 +599,40 @@ func parseQdrantSearchResult(result map[string]interface{}) ([]VectorSearchResul
 	}
 
 	return results, nil
+}
+
+// buildQdrantFilterFromConditions 将抽象 FilterCondition 转为 Qdrant filter
+func buildQdrantFilterFromConditions(filters []FilterCondition) map[string]interface{} {
+	if len(filters) == 0 {
+		return nil
+	}
+	var mustClauses []interface{}
+	for _, f := range filters {
+		switch f.Op {
+		case FilterOpIn:
+			if len(f.Values) == 1 {
+				mustClauses = append(mustClauses, map[string]interface{}{
+					"key": f.Field, "match": map[string]interface{}{"value": f.Values[0]},
+				})
+			} else {
+				var should []map[string]interface{}
+				for _, v := range f.Values {
+					should = append(should, map[string]interface{}{
+						"key": f.Field, "match": map[string]interface{}{"value": v},
+					})
+				}
+				mustClauses = append(mustClauses, map[string]interface{}{"should": should})
+			}
+		case FilterOpEqual:
+			if len(f.Values) > 0 {
+				mustClauses = append(mustClauses, map[string]interface{}{
+					"key": f.Field, "match": map[string]interface{}{"value": f.Values[0]},
+				})
+			}
+		}
+	}
+	if len(mustClauses) == 0 {
+		return nil
+	}
+	return map[string]interface{}{"must": mustClauses}
 }

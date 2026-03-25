@@ -35,8 +35,8 @@ import (
 
 // MilvusConfig Milvus 连接配置
 type MilvusConfig struct {
-	Addr       string        `toml:"addr"`       // http://localhost:19530
-	Token      string        `toml:"token"`      // API Token (Milvus Cloud)
+	Addr       string        `toml:"addr"`        // http://localhost:19530
+	Token      string        `toml:"token"`       // API Token (Milvus Cloud)
 	Database   string        `toml:"database"`    // 数据库名
 	Timeout    time.Duration `toml:"timeout"`     // HTTP 超时
 	MetricType string        `toml:"metric_type"` // COSINE / L2 / IP
@@ -274,9 +274,15 @@ func (s *MilvusVectorStore) SearchVectors(ctx context.Context, query VectorQuery
 		"outputFields":   query.ReturnFields,
 	}
 
-	// 构造过滤表达式
-	if query.FilterQuery != "" && query.FilterQuery != "*" {
-		searchBody["filter"] = convertToMilvusFilter(query.FilterQuery)
+	// 构造过滤表达式：优先使用抽象 Filters，降级使用 FilterQuery（问题 11）
+	filterExpr := ""
+	if len(query.Filters) > 0 {
+		filterExpr = buildMilvusFilter(query.Filters)
+	} else if query.FilterQuery != "" && query.FilterQuery != "*" {
+		filterExpr = convertToMilvusFilter(query.FilterQuery)
+	}
+	if filterExpr != "" {
+		searchBody["filter"] = filterExpr
 	}
 
 	if s.config.Database != "" {
@@ -292,58 +298,176 @@ func (s *MilvusVectorStore) SearchVectors(ctx context.Context, query VectorQuery
 }
 
 // HybridSearch Milvus 混合搜索
-// Milvus 2.4+ 支持 multi-vector search + Ranker 融合
+// 双路检索 + RRF 融合：向量搜索 + content 字段 like 过滤模拟全文检索
 func (s *MilvusVectorStore) HybridSearch(ctx context.Context, query HybridQuery) ([]VectorSearchResult, error) {
-	// Milvus 的 hybrid search 需要多个 ANN 请求 + RRF/WeightedRanker
-	// 当前退化为纯向量搜索 + 客户端过滤
-	return s.SearchVectors(ctx, query.VectorQuery)
-}
-
-// DeleteByFileID 按 file_id 删除
-func (s *MilvusVectorStore) DeleteByFileID(ctx context.Context, indexName, prefix, fileID string) (int64, error) {
-	body := map[string]interface{}{
-		"collectionName": indexName,
-		"filter":         fmt.Sprintf("file_id == \"%s\"", fileID),
-	}
-	if s.config.Database != "" {
-		body["dbName"] = s.config.Database
-	}
-
-	_, err := s.doRequest(ctx, "POST", "/v2/vectordb/entities/delete", body)
-	if err != nil {
-		return 0, fmt.Errorf("delete by file_id: %w", err)
-	}
-	return 0, nil // Milvus delete 不返回具体数量
-}
-
-// GetDocumentChunks 获取文档分块
-func (s *MilvusVectorStore) GetDocumentChunks(ctx context.Context, indexName, prefix, fileID string) ([]string, error) {
-	body := map[string]interface{}{
-		"collectionName": indexName,
-		"filter":         fmt.Sprintf("file_id == \"%s\"", fileID),
-		"outputFields":   []string{"content", "chunk_index"},
-		"limit":          10000,
-	}
-	if s.config.Database != "" {
-		body["dbName"] = s.config.Database
-	}
-
-	result, err := s.doRequest(ctx, "POST", "/v2/vectordb/entities/query", body)
+	// 第 1 路: 向量搜索
+	vectorResults, err := s.SearchVectors(ctx, query.VectorQuery)
 	if err != nil {
 		return nil, err
 	}
+	if query.TextQuery == "" {
+		return vectorResults, nil
+	}
 
-	var chunks []string
-	if data, ok := result["data"].([]interface{}); ok {
-		for _, item := range data {
-			if row, ok := item.(map[string]interface{}); ok {
-				if content, ok := row["content"].(string); ok {
-					chunks = append(chunks, content)
+	// 第 2 路: 基于 content 字段的文本匹配搜索
+	keywords := strings.Fields(query.TextQuery)
+	if len(keywords) == 0 {
+		return vectorResults, nil
+	}
+
+	var filterParts []string
+	for _, kw := range keywords {
+		kw = strings.ReplaceAll(kw, `"`, `\"`)
+		filterParts = append(filterParts, fmt.Sprintf(`content like "%%%s%%"`, kw))
+	}
+	textFilter := strings.Join(filterParts, " or ")
+
+	if len(query.Filters) > 0 {
+		mf := buildMilvusFilter(query.Filters)
+		if mf != "" {
+			textFilter = fmt.Sprintf("(%s) and (%s)", mf, textFilter)
+		}
+	} else if query.FilterQuery != "" && query.FilterQuery != "*" {
+		mf := convertToMilvusFilter(query.FilterQuery)
+		if mf != "" {
+			textFilter = fmt.Sprintf("(%s) and (%s)", mf, textFilter)
+		}
+	}
+
+	expandedTopK := query.TopK * 3
+	textBody := map[string]interface{}{
+		"collectionName": query.IndexName,
+		"filter":         textFilter,
+		"outputFields":   query.ReturnFields,
+		"limit":          expandedTopK,
+	}
+	if s.config.Database != "" {
+		textBody["dbName"] = s.config.Database
+	}
+
+	textResult, err := s.doRequest(ctx, "POST", "/v2/vectordb/entities/query", textBody)
+	var textResults []VectorSearchResult
+	if err == nil {
+		textResults = parseMilvusQueryAsSearchResult(textResult)
+	} else {
+		logrus.Warnf("[MilvusStore] Text query failed, falling back to vector-only: %v", err)
+		return vectorResults, nil
+	}
+
+	return mergeByRRF(vectorResults, textResults, query.VectorWeight, query.KeywordWeight, query.TopK), nil
+}
+
+// parseMilvusQueryAsSearchResult 将 query 结果转为 VectorSearchResult 以复用 RRF
+func parseMilvusQueryAsSearchResult(result map[string]interface{}) []VectorSearchResult {
+	var results []VectorSearchResult
+	data, ok := result["data"].([]interface{})
+	if !ok {
+		return results
+	}
+	for _, item := range data {
+		row, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		vsr := VectorSearchResult{Fields: make(map[string]string)}
+		if id, ok := row["id"].(string); ok {
+			vsr.Key = id
+		}
+		for k, v := range row {
+			if k == "id" {
+				continue
+			}
+			vsr.Fields[k] = fmt.Sprintf("%v", v)
+		}
+		results = append(results, vsr)
+	}
+	return results
+}
+
+// DeleteByFileID 按 file_id 删除，先计数再删除
+func (s *MilvusVectorStore) DeleteByFileID(ctx context.Context, indexName, prefix, fileID string) (int64, error) {
+	filterExpr := fmt.Sprintf("file_id == \"%s\"", fileID)
+
+	// 先统计匹配数量
+	countBody := map[string]interface{}{
+		"collectionName": indexName,
+		"filter":         filterExpr,
+		"outputFields":   []string{"id"},
+		"limit":          10000,
+	}
+	if s.config.Database != "" {
+		countBody["dbName"] = s.config.Database
+	}
+
+	var deletedCount int64
+	countResult, err := s.doRequest(ctx, "POST", "/v2/vectordb/entities/query", countBody)
+	if err == nil {
+		if data, ok := countResult["data"].([]interface{}); ok {
+			deletedCount = int64(len(data))
+		}
+	}
+
+	// 执行删除
+	body := map[string]interface{}{
+		"collectionName": indexName,
+		"filter":         filterExpr,
+	}
+	if s.config.Database != "" {
+		body["dbName"] = s.config.Database
+	}
+
+	_, err = s.doRequest(ctx, "POST", "/v2/vectordb/entities/delete", body)
+	if err != nil {
+		return 0, fmt.Errorf("delete by file_id: %w", err)
+	}
+
+	logrus.Infof("[MilvusStore] Deleted ~%d entities for file_id=%s", deletedCount, fileID)
+	return deletedCount, nil
+}
+
+// GetDocumentChunks 获取文档分块（分页查询，避免硬编码上限）
+func (s *MilvusVectorStore) GetDocumentChunks(ctx context.Context, indexName, prefix, fileID string) ([]string, error) {
+	const pageSize = 1000
+	var allChunks []string
+
+	for offset := 0; ; offset += pageSize {
+		body := map[string]interface{}{
+			"collectionName": indexName,
+			"filter":         fmt.Sprintf("file_id == \"%s\"", fileID),
+			"outputFields":   []string{"content", "chunk_index"},
+			"limit":          pageSize,
+			"offset":         offset,
+		}
+		if s.config.Database != "" {
+			body["dbName"] = s.config.Database
+		}
+
+		result, err := s.doRequest(ctx, "POST", "/v2/vectordb/entities/query", body)
+		if err != nil {
+			if len(allChunks) > 0 {
+				break
+			}
+			return nil, err
+		}
+
+		pageCount := 0
+		if data, ok := result["data"].([]interface{}); ok {
+			for _, item := range data {
+				if row, ok := item.(map[string]interface{}); ok {
+					if content, ok := row["content"].(string); ok {
+						allChunks = append(allChunks, content)
+						pageCount++
+					}
 				}
 			}
 		}
+
+		if pageCount < pageSize {
+			break
+		}
 	}
-	return chunks, nil
+
+	return allChunks, nil
 }
 
 // ListDocuments 列出文档
@@ -473,4 +597,27 @@ func parseMilvusSearchResult(result map[string]interface{}) ([]VectorSearchResul
 	}
 
 	return results, nil
+}
+
+// buildMilvusFilter 将抽象 FilterCondition 转为 Milvus 表达式
+func buildMilvusFilter(filters []FilterCondition) string {
+	if len(filters) == 0 {
+		return ""
+	}
+	var parts []string
+	for _, f := range filters {
+		switch f.Op {
+		case FilterOpIn:
+			quoted := make([]string, len(f.Values))
+			for i, v := range f.Values {
+				quoted[i] = fmt.Sprintf(`"%s"`, strings.ReplaceAll(v, `"`, `\"`))
+			}
+			parts = append(parts, fmt.Sprintf("%s in [%s]", f.Field, strings.Join(quoted, ", ")))
+		case FilterOpEqual:
+			if len(f.Values) > 0 {
+				parts = append(parts, fmt.Sprintf(`%s == "%s"`, f.Field, f.Values[0]))
+			}
+		}
+	}
+	return strings.Join(parts, " and ")
 }
