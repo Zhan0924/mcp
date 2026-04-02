@@ -1,3 +1,22 @@
+# 敏感文件（绝不提交到版本控制）
 .env
-scripts/rag-mcp.http
+certs/
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 构建产物
 *.exe
+mcp_rag_server
+
+# 脚本临时文件
+scripts/rag-mcp.http
+
+# Docker 数据卷（本地开发）
+data/
+
+# 备份文件
+backups/

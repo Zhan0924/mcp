@@ -30,7 +30,7 @@ services:
     container_name: mcp-rag-server
     restart: unless-stopped
     ports:
-      - "8082:8083"             # 宿主机 8082 → 容器 8083 (config.toml port=8083)
+      - "8083:8083"             # 统一单端口: MCP (/mcp) + Health (/health) + Metrics (/metrics)
     environment:
       # ---- Embedding Provider (主) ----
       - EMBEDDING_PRIMARY_BASE_URL=${EMBEDDING_PRIMARY_BASE_URL:-}
@@ -68,12 +68,21 @@ services:
       - REDIS_PASSWORD=${REDIS_PASSWORD:-123456}
     volumes:
       - ./config.toml:/app/config.toml:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8083/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     depends_on:
       redis-stack:
         condition: service_healthy
       # Neo4j 依赖条件启动: 仅当 graph_rag.enabled=true 且 graph_store_type="neo4j" 时需要
       # 如果不使用 Neo4j，可注释下面两行或使用 --no-deps 启动
       neo4j:
+        condition: service_healthy
+      # Milvus 依赖: 向量数据库后端
+      milvus:
         condition: service_healthy
     networks:
       - rag-network
@@ -150,6 +159,133 @@ services:
     networks:
       - rag-network
 
+  # ═════════════════════════════════════════════════════════════════════════
+  #  Milvus — 向量数据库 (VectorStore 后端)
+  #
+  #  架构: etcd (元数据) + MinIO (对象存储) + Milvus (向量引擎)
+  #  API:  RESTful http://milvus:19530/v2/vectordb/...
+  #  管理: Attu http://localhost:8000 (可选)
+  #
+  #  适用场景: 百万级以上向量，需要高性能 ANN 搜索
+  #  如不使用 Milvus，将 config.toml 中 vector_store.type 改为 "redis"
+  #  并注释掉以下 3 个服务
+  # ═════════════════════════════════════════════════════════════════════════
+
+  # Milvus 元数据存储
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    container_name: milvus-etcd
+    restart: unless-stopped
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296       # 4GB
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - etcd_data:/etcd
+    command: >
+      etcd
+      -advertise-client-urls=http://127.0.0.1:2379
+      -listen-client-urls=http://0.0.0.0:2379
+      --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - rag-network
+
+  # Milvus 对象存储 (向量数据 + 索引文件)
+  minio:
+    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+    container_name: milvus-minio
+    restart: unless-stopped
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    ports:
+      - "9010:9000"             # MinIO API (宿主机 9010 避免冲突)
+      - "9011:9001"             # MinIO Console
+    volumes:
+      - minio_data:/data
+    command: minio server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - rag-network
+
+  # Milvus 向量数据库 (Standalone 模式)
+  milvus:
+    image: milvusdb/milvus:v2.5.6
+    container_name: milvus
+    restart: unless-stopped
+    command: ["/milvus/bin/milvus", "run", "standalone"]   # 完整路径，镜像 Cmd=[] 需显式指定
+    environment:
+      - ETCD_ENDPOINTS=etcd:2379
+      - MINIO_ADDRESS=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+    ports:
+      - "19530:19530"           # Milvus gRPC + REST API
+      - "9099:9091"             # Milvus Metrics (宿主机 9099 避免冲突)
+    volumes:
+      - milvus_data:/var/lib/milvus
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 90s         # Milvus 冷启动较慢
+    networks:
+      - rag-network
+
+  # ── Prometheus (指标采集) ──────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v3.4.0
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    depends_on:
+      mcp-rag-server:
+        condition: service_healthy
+    networks:
+      - rag-network
+
+  # ── Grafana (指标可视化) ──────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.6.0
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - rag-network
+
 volumes:
   redis_data:
     name: mcp_rag_redis_data
@@ -157,6 +293,16 @@ volumes:
     name: mcp_rag_neo4j_data
   neo4j_logs:
     name: mcp_rag_neo4j_logs
+  etcd_data:
+    name: mcp_rag_etcd_data
+  minio_data:
+    name: mcp_rag_minio_data
+  milvus_data:
+    name: mcp_rag_milvus_data
+  prometheus_data:
+    name: mcp_rag_prometheus_data
+  grafana_data:
+    name: mcp_rag_grafana_data
 
 networks:
   rag-network:

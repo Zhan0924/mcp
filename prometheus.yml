@@ -1,0 +1,30 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  Prometheus 配置 — 采集 RAG MCP Server 指标
+#
+#  采集目标：
+#    - rag-mcp-server:8083/metrics   (应用指标 + Go runtime)
+#    - redis-exporter:9121/metrics   (Redis 指标，可选)
+#
+#  使用方式：挂载到 Prometheus 容器
+#    volumes:
+#      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+# ──────────────────────────────────────────────────────────────────────────────
+global:
+  scrape_interval: 15s      # 采集间隔
+  evaluation_interval: 15s  # 规则评估间隔
+  scrape_timeout: 10s       # 采集超时
+
+scrape_configs:
+  # RAG MCP Server 应用指标
+  - job_name: "rag-mcp-server"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["mcp-rag-server:8083"]
+        labels:
+          service: "rag-mcp-server"
+          env: "development"
+
+  # Prometheus 自身指标
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

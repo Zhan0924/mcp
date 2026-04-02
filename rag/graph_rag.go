@@ -174,10 +174,10 @@ func (s *InMemoryGraphStore) SearchByQuery(ctx context.Context, query string, to
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	result := &GraphSearchResult{}
-	queryLower := strings.ToLower(query)
-	words := strings.Fields(queryLower)
+	// 使用 extractQueryWords 支持中文 2-gram 分词
+	words := extractQueryWords(query)
 
-	// 简单的关键词匹配：查询词命中实体名称
+	// 关键词匹配：查询词命中实体名称
 	matchCount := 0
 	for _, e := range s.entities {
 		if matchCount >= topK {
@@ -185,7 +185,7 @@ func (s *InMemoryGraphStore) SearchByQuery(ctx context.Context, query string, to
 		}
 		nameLower := strings.ToLower(e.Name)
 		for _, w := range words {
-			if len(w) >= 2 && strings.Contains(nameLower, w) {
+			if strings.Contains(nameLower, w) {
 				result.Entities = append(result.Entities, e)
 				matchCount++
 				break

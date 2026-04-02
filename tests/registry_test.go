@@ -340,7 +340,7 @@ func TestRegisterAllRAGTools(t *testing.T) {
 	rerankCfg := rag.DefaultRerankConfig()
 
 	registry := tools.NewRegistry()
-	tools.RegisterAllRAGTools(registry, store, retCfg, chunkCfg, rerankCfg, 10*1024*1024, nil)
+	tools.RegisterAllRAGTools(registry, store, retCfg, chunkCfg, rerankCfg, 10*1024*1024, nil, nil, rag.DefaultUploadConfig())
 
 	mcpServer := server.NewMCPServer("test", "1.0.0",
 		server.WithResourceCapabilities(true, true),

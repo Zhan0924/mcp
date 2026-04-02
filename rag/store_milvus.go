@@ -28,6 +28,7 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -54,8 +55,10 @@ func DefaultMilvusConfig() MilvusConfig {
 
 // MilvusVectorStore 基于 Milvus RESTful API 的向量存储
 type MilvusVectorStore struct {
-	config     MilvusConfig
-	httpClient *http.Client
+	config             MilvusConfig
+	httpClient         *http.Client
+	mu                 sync.RWMutex // 保护 lastCollectionName 的并发安全
+	lastCollectionName string       // 最近一次 EnsureIndex 创建的 collection 名（用于 UpsertVectors 推断）
 }
 
 // NewMilvusVectorStore 创建 Milvus 向量存储实例
@@ -69,14 +72,58 @@ func NewMilvusVectorStore(cfg MilvusConfig) *MilvusVectorStore {
 	if cfg.MetricType == "" {
 		cfg.MetricType = "COSINE"
 	}
+	// 配置连接池：MaxIdleConnsPerHost 默认仅 2，高并发下严重不足
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 30,
+		IdleConnTimeout:     90 * time.Second,
+	}
 	return &MilvusVectorStore{
 		config:     cfg,
-		httpClient: &http.Client{Timeout: cfg.Timeout},
+		httpClient: &http.Client{Timeout: cfg.Timeout, Transport: transport},
 	}
 }
 
-// doRequest 执行 Milvus REST API 请求
+// setLastCollection 线程安全地设置 lastCollectionName
+func (s *MilvusVectorStore) setLastCollection(name string) {
+	s.mu.Lock()
+	s.lastCollectionName = name
+	s.mu.Unlock()
+}
+
+// getLastCollection 线程安全地获取 lastCollectionName
+func (s *MilvusVectorStore) getLastCollection() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastCollectionName
+}
+
+// doRequest 执行 Milvus REST API 请求（带自动重试，最多 3 次）
 func (s *MilvusVectorStore) doRequest(ctx context.Context, method, path string, body interface{}) (map[string]interface{}, error) {
+	const maxRetries = 3
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		result, err := s.doRequestOnce(ctx, method, path, body)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		// 仅对网络层错误重试，Milvus 业务错误（如 collection not found）不重试
+		if strings.Contains(err.Error(), "milvus error") {
+			return result, err
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		backoff := time.Duration(1<<uint(attempt)) * 200 * time.Millisecond
+		logrus.Warnf("[MilvusStore] Request %s %s failed (attempt %d/%d): %v, retrying in %v", method, path, attempt+1, maxRetries, err, backoff)
+		time.Sleep(backoff)
+	}
+	return nil, fmt.Errorf("after %d retries: %w", maxRetries, lastErr)
+}
+
+// doRequestOnce 执行单次 Milvus REST API 请求
+func (s *MilvusVectorStore) doRequestOnce(ctx context.Context, method, path string, body interface{}) (map[string]interface{}, error) {
 	url := strings.TrimSuffix(s.config.Addr, "/") + path
 
 	var bodyReader io.Reader
@@ -136,6 +183,7 @@ func (s *MilvusVectorStore) EnsureIndex(ctx context.Context, config IndexConfig)
 	_, err := s.doRequest(ctx, "POST", "/v2/vectordb/collections/describe", checkBody)
 	if err == nil {
 		logrus.Infof("[MilvusStore] Collection %s already exists", config.IndexName)
+		s.setLastCollection(config.IndexName)
 		return nil
 	}
 
@@ -197,6 +245,9 @@ func (s *MilvusVectorStore) EnsureIndex(ctx context.Context, config IndexConfig)
 	}
 
 	logrus.Infof("[MilvusStore] Created collection %s (dim=%d, algo=%s)", config.IndexName, config.Dimension, config.Algorithm)
+
+	// 缓存最近创建的 collection 名，供 UpsertVectors 使用
+	s.setLastCollection(config.IndexName)
 	return nil
 }
 
@@ -206,13 +257,15 @@ func (s *MilvusVectorStore) UpsertVectors(ctx context.Context, entries []VectorE
 		return 0, nil
 	}
 
-	// 按 collection 分组（从 Key 中解析 collection 名，或使用默认）
-	// 这里假设所有 entries 属于同一个 collection
-	// 从第一个 entry 的 Key 前缀推断 collection name
-	collectionName := inferCollectionName(entries[0].Key)
+	// 优先使用 EnsureIndex 缓存的 collection 名，否则从 Key 推断
+	collectionName := s.getLastCollection()
+	if collectionName == "" {
+		collectionName = inferCollectionName(entries[0].Key)
+	}
 
 	const batchSize = 500
 	totalInserted := 0
+	var batchErrors []string
 
 	for start := 0; start < len(entries); start += batchSize {
 		end := start + batchSize
@@ -229,7 +282,6 @@ func (s *MilvusVectorStore) UpsertVectors(ctx context.Context, entries []VectorE
 			for k, v := range e.Fields {
 				switch val := v.(type) {
 				case []byte:
-					// 将 []byte 向量转为 []float32
 					row[k] = bytesToFloat32Slice(val)
 				default:
 					row[k] = val
@@ -248,12 +300,18 @@ func (s *MilvusVectorStore) UpsertVectors(ctx context.Context, entries []VectorE
 
 		_, err := s.doRequest(ctx, "POST", "/v2/vectordb/entities/upsert", body)
 		if err != nil {
-			logrus.Errorf("[MilvusStore] Upsert batch error: %v", err)
+			logrus.Errorf("[MilvusStore] Upsert batch [%d:%d] error: %v", start, end, err)
+			batchErrors = append(batchErrors, fmt.Sprintf("batch[%d:%d]: %v", start, end, err))
 			continue
 		}
 		totalInserted += len(batch)
 	}
 
+	// 部分批次失败时返回错误（附带已成功数量），调用方可据此判断
+	if len(batchErrors) > 0 && totalInserted < len(entries) {
+		return totalInserted, fmt.Errorf("partial upsert: %d/%d inserted, errors: %s",
+			totalInserted, len(entries), strings.Join(batchErrors, "; "))
+	}
 	return totalInserted, nil
 }
 
@@ -386,7 +444,7 @@ func parseMilvusQueryAsSearchResult(result map[string]interface{}) []VectorSearc
 
 // DeleteByFileID 按 file_id 删除，先计数再删除
 func (s *MilvusVectorStore) DeleteByFileID(ctx context.Context, indexName, prefix, fileID string) (int64, error) {
-	filterExpr := fmt.Sprintf("file_id == \"%s\"", fileID)
+	filterExpr := fmt.Sprintf("file_id == \"%s\"", sanitizeMilvusString(fileID))
 
 	// 先统计匹配数量
 	countBody := map[string]interface{}{
@@ -433,7 +491,7 @@ func (s *MilvusVectorStore) GetDocumentChunks(ctx context.Context, indexName, pr
 	for offset := 0; ; offset += pageSize {
 		body := map[string]interface{}{
 			"collectionName": indexName,
-			"filter":         fmt.Sprintf("file_id == \"%s\"", fileID),
+			"filter":         fmt.Sprintf("file_id == \"%s\"", sanitizeMilvusString(fileID)),
 			"outputFields":   []string{"content", "chunk_index"},
 			"limit":          pageSize,
 			"offset":         offset,
@@ -518,6 +576,15 @@ func (s *MilvusVectorStore) Close() error {
 }
 
 // --- 辅助函数 ---
+
+// sanitizeMilvusString 防止 Milvus 过滤表达式注入
+// 移除双引号和反斜杠等可能改变表达式语义的字符
+func sanitizeMilvusString(s string) string {
+	s = strings.ReplaceAll(s, `\`, ``)
+	s = strings.ReplaceAll(s, `"`, ``)
+	s = strings.ReplaceAll(s, `'`, ``)
+	return s
+}
 
 // bytesToFloat32Slice 将字节切片还原为 float32 切片
 func bytesToFloat32Slice(data []byte) []float32 {

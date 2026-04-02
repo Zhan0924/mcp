@@ -31,7 +31,12 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
 
+	"mcp_rag_server/middleware"
 	"mcp_rag_server/rag"
 	"mcp_rag_server/tools"
 
@@ -78,12 +83,14 @@ func NewMCPServerWithGraphRAG(cfg *ServerConfig, redisClient redisCli.UniversalC
 }
 
 // CreateVectorStore 根据配置创建 VectorStore 实例
-// 支持 redis / milvus / qdrant 三种后端
+// 支持 redis / milvus / qdrant 三种后端，统一包裹 CircuitBreaker
 func CreateVectorStore(cfg *ServerConfig, redisClient redisCli.UniversalClient) rag.VectorStore {
 	storeType := ""
 	if cfg.VectorStore != nil {
 		storeType = cfg.VectorStore.Type
 	}
+
+	var inner rag.VectorStore
 
 	switch storeType {
 	case "milvus":
@@ -100,7 +107,7 @@ func CreateVectorStore(cfg *ServerConfig, redisClient redisCli.UniversalClient) 
 			}
 		}
 		log.Printf("Using Milvus VectorStore at %s", milvusCfg.Addr)
-		return rag.NewMilvusVectorStore(milvusCfg)
+		inner = rag.NewMilvusVectorStore(milvusCfg)
 
 	case "qdrant":
 		qdrantCfg := rag.DefaultQdrantConfig()
@@ -113,12 +120,18 @@ func CreateVectorStore(cfg *ServerConfig, redisClient redisCli.UniversalClient) 
 			}
 		}
 		log.Printf("Using Qdrant VectorStore at %s", qdrantCfg.Addr)
-		return rag.NewQdrantVectorStore(qdrantCfg)
+		inner = rag.NewQdrantVectorStore(qdrantCfg)
 
 	default:
 		log.Printf("Using Redis VectorStore")
-		return rag.NewRedisVectorStore(redisClient)
+		inner = rag.NewRedisVectorStore(redisClient)
 	}
+
+	// 包裹 CircuitBreaker 保护层
+	cbCfg := rag.DefaultStoreCircuitBreakerConfig()
+	store := rag.NewStoreCircuitBreaker(inner, cbCfg, nil)
+	log.Printf("VectorStore circuit breaker enabled (threshold=%d, timeout=%v)", cbCfg.FailureThreshold, cbCfg.Timeout)
+	return store
 }
 
 // StartServer 启动 MCP 服务器（Streamable HTTP）
@@ -131,14 +144,22 @@ func StartServerWithGraphRAG(cfg *ServerConfig, redisClient redisCli.UniversalCl
 	return StartServerFull(cfg, redisClient, taskQueue, graphStore, extractor, nil)
 }
 
-// StartServerFull 启动 MCP 服务器（完整版：支持 Graph RAG + 文件上传）
-func StartServerFull(cfg *ServerConfig, redisClient redisCli.UniversalClient, taskQueue *rag.TaskQueue, graphStore rag.GraphStore, extractor rag.EntityExtractor, uploadStore *rag.UploadStore) error {
+// BuildServerFull 构建 HTTP Server（不启动），用于外部控制优雅关闭。
+// 返回 *http.Server，调用方可通过 srv.ListenAndServe() 启动，
+// 再通过 srv.Shutdown(ctx) 优雅关闭已有连接。
+func BuildServerFull(cfg *ServerConfig, redisClient redisCli.UniversalClient, taskQueue *rag.TaskQueue, graphStore rag.GraphStore, extractor rag.EntityExtractor, uploadStore *rag.UploadStore) *http.Server {
 	mcpServer := NewMCPServerWithGraphRAG(cfg, redisClient, taskQueue, graphStore, extractor)
-	httpServer := server.NewStreamableHTTPServer(mcpServer)
 
-	// 组合路由：MCP 端点 + 文件上传端点
+	// Redis Session Manager：支持多实例部署
+	sessionMgr := middleware.NewRedisSessionManager(redisClient, middleware.DefaultRedisSessionConfig())
+	httpServer := server.NewStreamableHTTPServer(mcpServer,
+		server.WithSessionIdManager(sessionMgr),
+	)
+
+	// 组合路由：MCP 端点 + 健康检查 + 文件上传端点
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", httpServer)
+	mux.HandleFunc("/health", handleHealthCheck(cfg, redisClient))
 
 	if uploadStore != nil {
 		mux.HandleFunc("/upload", handleFileUpload(uploadStore))
@@ -146,14 +167,164 @@ func StartServerFull(cfg *ServerConfig, redisClient redisCli.UniversalClient, ta
 			uploadStore.GetConfig().MaxUploadSize/(1024*1024))
 	}
 
+	// ── 企业级中间件链 ──────────────────────────────────────────────
+	slogger := middleware.NewLogger(middleware.LogConfig{Level: "info", Format: "json"})
+
+	// 限流中间件
+	rlCfg := middleware.DefaultRateLimitConfig()
+	rateLimiter := middleware.NewRateLimitMiddleware(rlCfg, slogger)
+
+	// 审计日志中间件
+	auditMW := middleware.NewAuditMiddleware(middleware.AuditConfig{Enabled: true}, slogger)
+
+	// 分布式追踪中间件
+	tracerCfg := middleware.DefaultTracerConfig()
+	tracerCfg.ServiceName = cfg.Server.Name
+	tracer := middleware.NewTracer(tracerCfg, slogger)
+
+	// Prometheus 指标
+	prom := middleware.NewPrometheusMetrics()
+
+	// 认证中间件（默认关闭，生产环境通过 config.toml [auth] enabled=true 启用）
+	authCfg := middleware.AuthConfig{
+		Enabled:   false,
+		Mode:      "api_key",
+		SkipPaths: []string{"/health", "/metrics"},
+		APIKeys:   make(map[string]int64),
+	}
+	// 从环境变量 AUTH_API_KEYS 读取 API Keys（格式: "key1:uid1,key2:uid2"）
+	if keys := os.Getenv("AUTH_API_KEYS"); keys != "" {
+		authCfg.Enabled = true
+		for _, pair := range strings.Split(keys, ",") {
+			parts := strings.SplitN(pair, ":", 2)
+			if len(parts) == 2 {
+				if uid, err := strconv.ParseInt(parts[1], 10, 64); err == nil {
+					authCfg.APIKeys[parts[0]] = uid
+				}
+			}
+		}
+	}
+	if secret := os.Getenv("AUTH_JWT_SECRET"); secret != "" {
+		authCfg.JWTSecret = secret
+	}
+	authMW := middleware.NewAuthMiddleware(authCfg, slogger)
+
+	// 中间件链：Prometheus → 追踪 → 认证 → 限流 → 审计 → 路由
+	// 注意：不使用 TimeoutMiddleware，因为 /mcp 是 SSE 长连接，超时会断开连接
+	handler := middleware.Chain(mux,
+		prom.HTTPMiddleware,
+		tracer.Handler,
+		authMW.Handler,
+		rateLimiter.Handler,
+		auditMW.Handler,
+	)
+
+	// Prometheus /metrics 端点（替代旧的 JSON metrics）
+	mux.Handle("/metrics", prom.Handler())
+
+	// JSON /metrics-json 端点（向后兼容）
+	jsonMetrics := middleware.NewMetrics(slogger)
+	mux.Handle("/metrics-json", jsonMetrics.MetricsHandler())
+
+	// Traces 端点
+	mux.HandleFunc("/traces", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		traces := tracer.GetRecentTraces(50)
+		json.NewEncoder(w).Encode(traces)
+	})
+
+	log.Printf("Middleware enabled: prometheus, tracing, rate_limit(%.0f rps), audit", rlCfg.GlobalRPS)
+	// ─────────────────────────────────────────────────────────────────
+
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
 	log.Printf("RAG MCP Server listening on %s/mcp", addr)
+	log.Printf("Health check available at %s/health", addr)
+	log.Printf("Metrics (Prometheus) at %s/metrics", addr)
+	log.Printf("Metrics (JSON) at %s/metrics-json", addr)
+	log.Printf("Traces available at %s/traces", addr)
 
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: mux,
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	if cfg.Server.TLS.Enabled {
+		log.Printf("TLS enabled: cert=%s, key=%s", cfg.Server.TLS.CertFile, cfg.Server.TLS.KeyFile)
+	}
+	return srv
+}
+
+// StartServerFull 启动 MCP 服务器（完整版，向后兼容）
+func StartServerFull(cfg *ServerConfig, redisClient redisCli.UniversalClient, taskQueue *rag.TaskQueue, graphStore rag.GraphStore, extractor rag.EntityExtractor, uploadStore *rag.UploadStore) error {
+	srv := BuildServerFull(cfg, redisClient, taskQueue, graphStore, extractor, uploadStore)
+	if cfg.Server.TLS.Enabled {
+		return srv.ListenAndServeTLS(cfg.Server.TLS.CertFile, cfg.Server.TLS.KeyFile)
 	}
 	return srv.ListenAndServe()
+}
+
+// handleHealthCheck 健康检查端点
+// GET /health
+//
+// 返回服务状态、版本信息和依赖组件连通性，用于 Docker HEALTHCHECK、
+// 负载均衡探针和运维 curl 快速验证，避免直接 GET /mcp 挂在 SSE 长连接上。
+//
+// 响应示例:
+//
+//	{
+//	  "status": "healthy",
+//	  "server": "rag-mcp-server",
+//	  "version": "2.0.0",
+//	  "redis": "ok",
+//	  "uptime": "2h15m30s"
+//	}
+func handleHealthCheck(cfg *ServerConfig, redisClient redisCli.UniversalClient) http.HandlerFunc {
+	startTime := time.Now()
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		result := map[string]interface{}{
+			"status":  "healthy",
+			"server":  cfg.Server.Name,
+			"version": cfg.Server.Version,
+			"uptime":  time.Since(startTime).Round(time.Second).String(),
+		}
+
+		// 检测 Redis 连通性（2s 超时，防止阻塞健康检查）
+		httpStatus := http.StatusOK
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := redisClient.Ping(ctx).Err(); err != nil {
+			result["status"] = "degraded"
+			result["redis"] = fmt.Sprintf("error: %v", err)
+			httpStatus = http.StatusServiceUnavailable
+		} else {
+			result["redis"] = "ok"
+		}
+
+		// 检测 Embedding Manager 状态
+		manager := rag.GetGlobalManager()
+		if manager != nil {
+			stats := manager.GetStats()
+			activeProviders := 0
+			for _, s := range stats {
+				if s.Status == "active" {
+					activeProviders++
+				}
+			}
+			result["embedding_providers"] = fmt.Sprintf("%d/%d active", activeProviders, len(stats))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(httpStatus)
+		json.NewEncoder(w).Encode(result)
+	}
 }
 
 // handleFileUpload 处理文件上传请求

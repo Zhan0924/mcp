@@ -35,11 +35,10 @@ RUN mkdir -p /tmp/rag-uploads
 # 暴露服务端口 (与 config.toml [server].port 保持一致)
 EXPOSE 8083
 
-# 健康检查: 每 30s 探测服务是否存活，连续 3 次失败则标记为 unhealthy
-# MCP 端点仅接受特定格式的 POST 请求，正常返回 4xx 也说明进程存活
-# 此处用 wget 发 POST 并忽略 HTTP 状态码，仅在 TCP 连接失败时返回失败
+# 健康检查: 每 30s 探测 /health 端点，返回 JSON 包含服务状态和依赖连通性
+# /health 端点会检测 Redis 连通性，503 表示服务降级，200 表示全部正常
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -q --post-data '{}' -O /dev/null http://localhost:8083/mcp 2>/dev/null; test $? -ne 4
+  CMD wget -q -O /dev/null http://localhost:8083/health || exit 1
 
 # 启动服务
 CMD ["./rag-mcp-server", "-config", "config.toml"]

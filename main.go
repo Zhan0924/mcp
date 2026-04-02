@@ -145,10 +145,17 @@ func main() {
 		cfg.Retriever.IndexAlgorithm, cfg.Retriever.HybridSearchEnabled,
 		cfg.Chunking.StructureAware, cfg.Rerank.Enabled, asyncCfg.Enabled, cfg.GraphRAG.Enabled)
 
+	// 构建 HTTP Server（不立即启动），用于优雅关闭
+	srv := BuildServerFull(cfg, redisClient, taskQueue, graphStore, entityExtractor, uploadStore)
+
 	// 在独立 goroutine 中启动 HTTP 服务器，主 goroutine 用于信号监听
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- StartServerFull(cfg, redisClient, taskQueue, graphStore, entityExtractor, uploadStore)
+		if cfg.Server.TLS.Enabled {
+			errCh <- srv.ListenAndServeTLS(cfg.Server.TLS.CertFile, cfg.Server.TLS.KeyFile)
+		} else {
+			errCh <- srv.ListenAndServe()
+		}
 	}()
 
 	logrus.Info("----------------------------------------")
@@ -163,20 +170,34 @@ func main() {
 
 	select {
 	case sig := <-sigChan:
-		logrus.Infof("收到信号 %v，正在关闭服务器...", sig)
+		logrus.Infof("收到信号 %v，正在优雅关闭服务器...", sig)
 	case err := <-errCh:
 		logrus.Errorf("服务异常退出: %v", err)
 	}
 
-	// 关闭顺序：Worker → Manager → Redis，确保 in-flight 任务完成后再断开连接
+	// ── 优雅关闭：按依赖反序关闭，确保 in-flight 请求和任务完成 ──
 	logrus.Info("正在清理资源...")
+
+	// 1. 优雅关闭 HTTP Server：等待已有连接完成（最多 15 秒）
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logrus.Warnf("HTTP 服务器关闭超时: %v", err)
+	} else {
+		logrus.Info("HTTP 服务器已优雅关闭")
+	}
+
+	// 2. 停止文件上传清理
 	if uploadStore != nil {
 		uploadStore.Stop()
 	}
+	// 3. 停止异步索引 Worker（等待 in-flight 任务完成）
 	if indexWorker != nil {
 		indexWorker.Stop() // 内部调用 cancel + wg.Wait，等待所有 goroutine 退出
 	}
+	// 4. 停止 Embedding Manager 健康检查
 	manager.Stop()
+	// 5. 最后关闭 Redis 连接池
 	if err := redisClient.Close(); err != nil {
 		logrus.Warnf("关闭 Redis 连接时出错: %v", err)
 	}

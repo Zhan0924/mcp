@@ -1,0 +1,137 @@
+---
+# RAG MCP Server — Kubernetes Deployment
+# 生产环境部署配置：滚动更新 + HPA + PDB + 资源限制
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-mcp-server
+  labels:
+    app: rag-mcp-server
+    version: v2.0.0
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # 零停机更新
+  selector:
+    matchLabels:
+      app: rag-mcp-server
+  template:
+    metadata:
+      labels:
+        app: rag-mcp-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8083"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+      - name: rag-mcp-server
+        image: rag-mcp-server:latest
+        ports:
+        - containerPort: 8083
+          name: http
+          protocol: TCP
+        envFrom:
+        - secretRef:
+            name: rag-mcp-secrets
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8083
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8083
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 2
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8083
+          initialDelaySeconds: 3
+          periodSeconds: 5
+          failureThreshold: 10
+        volumeMounts:
+        - name: config
+          mountPath: /app/config.toml
+          subPath: config.toml
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: rag-mcp-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-mcp-server
+  labels:
+    app: rag-mcp-server
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8083
+    targetPort: 8083
+    protocol: TCP
+    name: http
+  selector:
+    app: rag-mcp-server
+---
+# HPA — CPU 驱动自动扩缩容
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rag-mcp-server
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: rag-mcp-server
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # 缩容冷却 5 分钟
+    scaleUp:
+      stabilizationWindowSeconds: 60   # 扩容冷却 1 分钟
+---
+# PDB — 保证滚动更新期间至少 1 个 Pod 可用
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rag-mcp-server
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: rag-mcp-server

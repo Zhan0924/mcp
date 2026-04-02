@@ -68,6 +68,14 @@ func NewNeo4jGraphStore(ctx context.Context, cfg Neo4jConfig) (*Neo4jGraphStore,
 	driver, err := neo4j.NewDriverWithContext(
 		cfg.URI,
 		neo4j.BasicAuth(cfg.Username, cfg.Password, ""),
+		func(config *neo4j.Config) {
+			if cfg.MaxConnPool > 0 {
+				config.MaxConnectionPoolSize = cfg.MaxConnPool
+			}
+			if cfg.ConnectTimeout > 0 {
+				config.ConnectionAcquisitionTimeout = cfg.ConnectTimeout
+			}
+		},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create neo4j driver: %w", err)
@@ -115,11 +123,18 @@ func (s *Neo4jGraphStore) ensureIndexes(ctx context.Context) error {
 // AddEntities 批量添加实体节点
 // 使用 MERGE 保证幂等性：同名同类型同来源的实体不会重复创建
 // UNWIND + MERGE 模式比逐条执行减少 95% 的网络往返
+// 集成指数退避重试，应对 Neo4j 瞬时连接故障
 func (s *Neo4jGraphStore) AddEntities(ctx context.Context, entities []Entity) error {
 	if len(entities) == 0 {
 		return nil
 	}
 
+	return WithRetry(ctx, DefaultRetryConfig(), "neo4j.AddEntities", nil, func(ctx context.Context) error {
+		return s.addEntitiesInternal(ctx, entities)
+	})
+}
+
+func (s *Neo4jGraphStore) addEntitiesInternal(ctx context.Context, entities []Entity) error {
 	session := s.driver.NewSession(ctx, neo4j.SessionConfig{DatabaseName: s.database})
 	defer session.Close(ctx)
 
@@ -252,19 +267,19 @@ func (s *Neo4jGraphStore) SearchByEntity(ctx context.Context, entityName string,
 	session := s.driver.NewSession(ctx, neo4j.SessionConfig{DatabaseName: s.database})
 	defer session.Close(ctx)
 
-	// 使用变长路径模式匹配 1..depth 跳内的所有节点和关系
-	cypher := fmt.Sprintf(`
+	// 两步查询：
+	// Step 1: 收集实体
+	// Step 2: 收集关系（包含 source/target 名称）
+	entityCypher := fmt.Sprintf(`
 		MATCH (start:Entity)
 		WHERE toLower(start.name) CONTAINS toLower($name)
 		OPTIONAL MATCH path = (start)-[*1..%d]-(neighbor:Entity)
-		WITH start, collect(DISTINCT neighbor) AS neighbors,
-		     collect(DISTINCT relationships(path)) AS allRels
-		RETURN start, neighbors,
-		       [r IN reduce(acc = [], rels IN allRels | acc + rels) | r] AS relations
+		WITH start, collect(DISTINCT neighbor) AS neighbors
+		RETURN start, neighbors
 		LIMIT 50
 	`, depth)
 
-	result, err := session.Run(ctx, cypher, map[string]interface{}{"name": entityName})
+	result, err := session.Run(ctx, entityCypher, map[string]interface{}{"name": entityName})
 	if err != nil {
 		return nil, fmt.Errorf("search by entity: %w", err)
 	}
@@ -300,15 +315,37 @@ func (s *Neo4jGraphStore) SearchByEntity(ctx context.Context, entityName string,
 				}
 			}
 		}
+	}
 
-		// 解析关系
-		if rels, ok := record.Get("relations"); ok {
-			if relList, ok := rels.([]interface{}); ok {
-				for _, r := range relList {
-					if rel, ok := r.(neo4j.Relationship); ok {
-						graphResult.Relations = append(graphResult.Relations, relationToRelation(rel))
-					}
+	// Step 2: 查询关系，显式返回 source/target 名称
+	if len(graphResult.Entities) > 0 {
+		names := make([]string, len(graphResult.Entities))
+		for i, e := range graphResult.Entities {
+			names[i] = e.Name
+		}
+		relCypher := `
+			MATCH (src:Entity)-[r]->(tgt:Entity)
+			WHERE src.name IN $names AND tgt.name IN $names
+			RETURN src.name AS source, tgt.name AS target, type(r) AS rel_type,
+			       r.source_file AS source_file
+			LIMIT 200
+		`
+		relResult, relErr := session.Run(ctx, relCypher, map[string]interface{}{"names": names})
+		if relErr == nil {
+			for relResult.Next(ctx) {
+				rec := relResult.Record()
+				src, _ := rec.Get("source")
+				tgt, _ := rec.Get("target")
+				relType, _ := rec.Get("rel_type")
+				srcFile, _ := rec.Get("source_file")
+				rel := Relation{
+					Source:     fmt.Sprintf("%v", src),
+					Target:     fmt.Sprintf("%v", tgt),
+					Type:       fmt.Sprintf("%v", relType),
+					SourceFile: fmt.Sprintf("%v", srcFile),
+					Properties: make(map[string]string),
 				}
+				graphResult.Relations = append(graphResult.Relations, rel)
 			}
 		}
 	}
@@ -514,6 +551,7 @@ func relationToRelation(rel neo4j.Relationship) Relation {
 }
 
 // extractQueryWords extracts meaningful keywords from query (length >= 2)
+// 支持中文：将连续中文字符按 2-gram 切分为搜索词（如 "微服务架构" → ["微服", "服务", "务架", "架构"]）
 func extractQueryWords(query string) []string {
 	words := strings.Fields(strings.ToLower(query))
 	var result []string
@@ -523,14 +561,20 @@ func extractQueryWords(query string) []string {
 		"the": true, "is": true, "a": true, "an": true, "in": true, "on": true,
 		"of": true, "to": true, "for": true, "and": true, "or": true, "how": true,
 		"what": true, "why": true, "when": true, "where": true, "which": true,
+		"的": true, "是": true, "了": true, "在": true, "和": true, "与": true,
+		"有": true, "什么": true, "如何": true, "怎么": true, "哪些": true,
+	}
+
+	addWord := func(w string) {
+		if len(w) >= 2 && !stopWords[w] && !seen[w] {
+			seen[w] = true
+			result = append(result, w)
+		}
 	}
 
 	for _, w := range words {
 		w = strings.TrimFunc(w, func(r rune) bool {
-			if r >= 'a' && r <= 'z' {
-				return false
-			}
-			if r >= '0' && r <= '9' {
+			if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
 				return false
 			}
 			if r >= 0x4e00 && r <= 0x9fff {
@@ -539,13 +583,47 @@ func extractQueryWords(query string) []string {
 			if r == '_' || r == '-' {
 				return false
 			}
-			return true // trim all punctuation
+			return true
 		})
-		if len(w) < 2 || stopWords[w] || seen[w] {
-			continue
+
+		// 分离中文和英文部分
+		runes := []rune(w)
+		var cjkRunes []rune
+		var asciiPart []rune
+
+		for _, r := range runes {
+			if r >= 0x4e00 && r <= 0x9fff {
+				cjkRunes = append(cjkRunes, r)
+				// flush ascii part
+				if len(asciiPart) > 0 {
+					addWord(string(asciiPart))
+					asciiPart = nil
+				}
+			} else {
+				asciiPart = append(asciiPart, r)
+				// flush CJK part as 2-grams
+				if len(cjkRunes) > 0 {
+					cjkStr := string(cjkRunes)
+					addWord(cjkStr) // 整体作为搜索词
+					// 2-gram 切分
+					for i := 0; i+1 < len(cjkRunes); i++ {
+						addWord(string(cjkRunes[i : i+2]))
+					}
+					cjkRunes = nil
+				}
+			}
 		}
-		seen[w] = true
-		result = append(result, w)
+		// flush remaining
+		if len(asciiPart) > 0 {
+			addWord(string(asciiPart))
+		}
+		if len(cjkRunes) > 0 {
+			cjkStr := string(cjkRunes)
+			addWord(cjkStr)
+			for i := 0; i+1 < len(cjkRunes); i++ {
+				addWord(string(cjkRunes[i : i+2]))
+			}
+		}
 	}
 	return result
 }

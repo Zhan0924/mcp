@@ -2,24 +2,26 @@
 rag/errors.go — RAG 子系统统一错误体系
 
 设计原则:
-  1. 类型化错误码（ErrorCode）: 以 string 为底层类型而非 int，
-     使错误码在 JSON 响应中直接可读（如 "RAG_001"），无需额外映射表。
-     调用方可通过 HasErrorCode() 做程序化分支判断，而非字符串匹配。
 
-  2. 错误链（Error Chain）: RAGError 实现 Unwrap() 方法，
-     支持 Go 1.13+ 的 errors.Is() / errors.As() 错误链遍历。
-     例如: 当 Redis 超时触发 ErrCodeSearchFailed 时，Cause 保留原始 redis 错误，
-     上层可通过 errors.Is(err, context.DeadlineExceeded) 识别超时根因。
+ 1. 类型化错误码（ErrorCode）: 以 string 为底层类型而非 int，
+    使错误码在 JSON 响应中直接可读（如 "RAG_001"），无需额外映射表。
+    调用方可通过 HasErrorCode() 做程序化分支判断，而非字符串匹配。
 
-  3. 三层错误信息: Code（机器可读）+ Message（人类可读摘要）+ Detail（现场上下文），
-     tools 层直接将 RAGError 格式化后返回给 MCP 客户端，无需额外包装。
+ 2. 错误链（Error Chain）: RAGError 实现 Unwrap() 方法，
+    支持 Go 1.13+ 的 errors.Is() / errors.As() 错误链遍历。
+    例如: 当 Redis 超时触发 ErrCodeSearchFailed 时，Cause 保留原始 redis 错误，
+    上层可通过 errors.Is(err, context.DeadlineExceeded) 识别超时根因。
+
+ 3. 三层错误信息: Code（机器可读）+ Message（人类可读摘要）+ Detail（现场上下文），
+    tools 层直接将 RAGError 格式化后返回给 MCP 客户端，无需额外包装。
 
 导出类型:
   - ErrorCode          — 错误码字面量类型（string 底层）
   - RAGError           — 统一错误结构体，实现 error + Unwrap 接口
 
 导出常量（18 个错误码）:
-  ErrCodeIndexNotFound  .. ErrCodeManagerNotReady  (RAG_001 ~ RAG_018)
+
+	ErrCodeIndexNotFound  .. ErrCodeManagerNotReady  (RAG_001 ~ RAG_018)
 
 导出函数:
   - NewRAGError(code, detail, cause)   — 标准构造器
@@ -35,6 +37,18 @@ package rag
 
 import (
 	"fmt"
+	"time"
+)
+
+// ErrorCategory 错误分类，用于自动化响应策略
+type ErrorCategory string
+
+const (
+	CategoryInput      ErrorCategory = "input"      // 客户端输入错误（4xx）
+	CategoryTransient  ErrorCategory = "transient"  // 瞬时故障，可重试（5xx retryable）
+	CategoryPermanent  ErrorCategory = "permanent"  // 永久性故障（5xx not retryable）
+	CategoryDependency ErrorCategory = "dependency" // 依赖服务故障
+	CategoryQuota      ErrorCategory = "quota"      // 配额/限流
 )
 
 // ErrorCode RAG 错误码。
@@ -44,10 +58,11 @@ type ErrorCode string
 
 // 错误码常量: RAG_001 ~ RAG_018
 // 按故障域分组:
-//   001-006: 核心读写路径（索引 / embedding / 检索 / 输入校验）
-//   007-009: Embedding Provider 可用性（无 provider / 超时 / 熔断）
-//   010-012: 辅助功能（重排序 / 解析 / 缓存）
-//   013-018: 系统级（配置 / 文档不存在 / 批量 / 混合检索 / 格式 / 就绪状态）
+//
+//	001-006: 核心读写路径（索引 / embedding / 检索 / 输入校验）
+//	007-009: Embedding Provider 可用性（无 provider / 超时 / 熔断）
+//	010-012: 辅助功能（重排序 / 解析 / 缓存）
+//	013-018: 系统级（配置 / 文档不存在 / 批量 / 混合检索 / 格式 / 就绪状态）
 const (
 	ErrCodeIndexNotFound     ErrorCode = "RAG_001" // Redis 中找不到指定用户的索引
 	ErrCodeEmbeddingFailed   ErrorCode = "RAG_002" // 调用 Embedding API 失败
@@ -98,10 +113,14 @@ var errorMessages = map[ErrorCode]string{
 //   - errors.Is(err, target) 沿 Cause 链查找特定错误
 //   - errors.As(err, &target) 沿 Cause 链做类型断言
 type RAGError struct {
-	Code    ErrorCode // 机器可读错误码，用于程序化分支
-	Message string    // 该错误码对应的通用描述（来自 errorMessages）
-	Detail  string    // 本次调用的具体上下文信息
-	Cause   error     // 原始底层错误，构成错误链
+	Code       ErrorCode     // 机器可读错误码，用于程序化分支
+	Category   ErrorCategory // 错误分类（input/transient/permanent/dependency/quota）
+	Message    string        // 该错误码对应的通用描述（来自 errorMessages）
+	UserMsg    string        // 面向终端用户的友好提示（可直接展示到 UI）
+	Detail     string        // 本次调用的具体上下文信息
+	Cause      error         // 原始底层错误，构成错误链
+	RetryAfter time.Duration // 可重试时的建议等待时间（0 表示不可重试）
+	HTTPStatus int           // 建议的 HTTP 状态码（0 使用默认映射）
 }
 
 // Error 格式: [RAG_XXX] 通用描述: 具体细节 (caused by: 底层错误)
@@ -129,11 +148,16 @@ func NewRAGError(code ErrorCode, detail string, cause error) *RAGError {
 	if !ok {
 		msg = "Unknown error"
 	}
+	meta := errorMeta[code]
 	return &RAGError{
-		Code:    code,
-		Message: msg,
-		Detail:  detail,
-		Cause:   cause,
+		Code:       code,
+		Category:   meta.Category,
+		Message:    msg,
+		UserMsg:    meta.UserMsg,
+		Detail:     detail,
+		Cause:      cause,
+		RetryAfter: meta.RetryAfter,
+		HTTPStatus: meta.HTTPStatus,
 	}
 }
 
@@ -170,4 +194,77 @@ func ErrorCodeMessage(code ErrorCode) string {
 		return msg
 	}
 	return "Unknown error"
+}
+
+// IsRetryable 判断此错误是否可以重试
+func (e *RAGError) IsRetryable() bool {
+	return e.Category == CategoryTransient || e.Category == CategoryDependency
+}
+
+// GetHTTPStatus 返回建议的 HTTP 状态码
+func (e *RAGError) GetHTTPStatus() int {
+	if e.HTTPStatus > 0 {
+		return e.HTTPStatus
+	}
+	switch e.Category {
+	case CategoryInput:
+		return 400
+	case CategoryQuota:
+		return 429
+	case CategoryTransient, CategoryDependency:
+		return 503
+	default:
+		return 500
+	}
+}
+
+// GetUserMessage 返回面向用户的友好消息
+func (e *RAGError) GetUserMessage() string {
+	if e.UserMsg != "" {
+		return e.UserMsg
+	}
+	return e.Message
+}
+
+// WithUserMsg 设置用户友好消息（链式调用）
+func (e *RAGError) WithUserMsg(msg string) *RAGError {
+	e.UserMsg = msg
+	return e
+}
+
+// WithRetryAfter 设置重试等待时间（链式调用）
+func (e *RAGError) WithRetryAfter(d time.Duration) *RAGError {
+	e.RetryAfter = d
+	return e
+}
+
+// ── 错误码元数据 ─────────────────────────────────────────────────────────────
+
+type errorCodeMeta struct {
+	Category   ErrorCategory
+	UserMsg    string
+	RetryAfter time.Duration
+	HTTPStatus int
+}
+
+// errorMeta 错误码 → 自动化元数据
+var errorMeta = map[ErrorCode]errorCodeMeta{
+	ErrCodeIndexNotFound:     {CategoryInput, "请求的索引不存在，请先索引文档", 0, 404},
+	ErrCodeEmbeddingFailed:   {CategoryDependency, "文本向量化服务暂时不可用，请稍后重试", 5 * time.Second, 503},
+	ErrCodeIndexCreateFailed: {CategoryTransient, "创建索引失败，请稍后重试", 3 * time.Second, 503},
+	ErrCodeSearchFailed:      {CategoryTransient, "搜索服务暂时不可用，请稍后重试", 3 * time.Second, 503},
+	ErrCodeInvalidInput:      {CategoryInput, "请求参数无效，请检查输入", 0, 400},
+	ErrCodeContentTooLarge:   {CategoryInput, "文档内容过大，请缩小文件后重试", 0, 413},
+	ErrCodeNoProviders:       {CategoryDependency, "AI 服务暂时不可用，请稍后重试", 10 * time.Second, 503},
+	ErrCodeProviderTimeout:   {CategoryTransient, "AI 服务响应超时，请稍后重试", 5 * time.Second, 504},
+	ErrCodeCircuitOpen:       {CategoryDependency, "服务正在恢复中，请稍后重试", 30 * time.Second, 503},
+	ErrCodeRerankFailed:      {CategoryTransient, "搜索结果优化失败，返回未优化结果", 0, 200},
+	ErrCodeParseFailed:       {CategoryInput, "文档格式无法解析，请检查文件是否损坏", 0, 422},
+	ErrCodeCacheFailed:       {CategoryTransient, "缓存服务异常，已降级处理", 0, 200},
+	ErrCodeConfigInvalid:     {CategoryPermanent, "服务配置异常，请联系管理员", 0, 500},
+	ErrCodeDocumentNotFound:  {CategoryInput, "指定的文档不存在", 0, 404},
+	ErrCodeBatchFailed:       {CategoryTransient, "批量操作部分失败，请重试", 3 * time.Second, 207},
+	ErrCodeHybridMergeFailed: {CategoryTransient, "搜索结果合并失败，已降级处理", 0, 200},
+	ErrCodeUnsupportedFormat: {CategoryInput, "不支持的文件格式", 0, 415},
+	ErrCodeManagerNotReady:   {CategoryTransient, "服务正在启动中，请稍后重试", 5 * time.Second, 503},
 }

@@ -26,14 +26,15 @@ import "github.com/google/uuid"
 // 由 Retriever.Search 返回，经 tools 层序列化后作为 MCP JSON 响应的一部分。
 // RelevanceScore 已经过归一化（0~1），分数越高相关性越强。
 type RetrievalResult struct {
-	ChunkID        string        `json:"chunk_id"`
-	ParentChunkID  string        `json:"parent_chunk_id,omitempty"` // 用于 Parent-Child Retriever 的分组去重
-	FileID         string        `json:"file_id"`
-	FileName       string        `json:"file_name"`
-	ChunkIndex     int           `json:"chunk_index"` // 该 chunk 在原始文档中的顺序号，便于上层重建上下文
-	Content        string        `json:"content"`
-	RelevanceScore float64       `json:"relevance_score"`         // 归一化相关性得分 [0, 1]
-	ScoreDetails   *ScoreDetails `json:"score_details,omitempty"` // 检索分数可解释性明细
+	ChunkID             string        `json:"chunk_id"`
+	ParentChunkID       string        `json:"parent_chunk_id,omitempty"`       // 用于 Parent-Child Retriever 的分组去重
+	MatchedChildContent string        `json:"matched_child_content,omitempty"` // 实际匹配的子块内容（父子块模式时展示）
+	FileID              string        `json:"file_id"`
+	FileName            string        `json:"file_name"`
+	ChunkIndex          int           `json:"chunk_index"` // 该 chunk 在原始文档中的顺序号，便于上层重建上下文
+	Content             string        `json:"content"`
+	RelevanceScore      float64       `json:"relevance_score"`         // 归一化相关性得分 [0, 1]
+	ScoreDetails        *ScoreDetails `json:"score_details,omitempty"` // 检索分数可解释性明细
 }
 
 // ScoreDetails 检索分数可解释性明细。

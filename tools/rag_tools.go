@@ -156,13 +156,13 @@ func (p *RAGToolProvider) searchTool() Tool {
 		args := request.GetArguments()
 
 		query, _ := args["query"].(string)
-		if query == "" {
-			return toolError(rag.ErrCodeInvalidInput, "query is required")
+		if err := rag.ValidateQuery(query); err != nil {
+			return toolError(rag.ErrCodeInvalidInput, err.Error())
 		}
 
 		userIDFloat, _ := args["user_id"].(float64)
-		if userIDFloat <= 0 {
-			return toolError(rag.ErrCodeInvalidInput, "user_id is required and must be positive")
+		if err := rag.ValidateUserID(int64(userIDFloat)); err != nil {
+			return toolError(rag.ErrCodeInvalidInput, err.Error())
 		}
 		userID := uint(userIDFloat)
 
@@ -267,17 +267,20 @@ func (p *RAGToolProvider) indexDocumentTool() Tool {
 		args := request.GetArguments()
 
 		fileID, _ := args["file_id"].(string)
-		if fileID == "" {
-			return toolError(rag.ErrCodeInvalidInput, "file_id is required")
+		if err := rag.ValidateFileID(fileID); err != nil {
+			return toolError(rag.ErrCodeInvalidInput, err.Error())
 		}
 
 		userIDFloat, _ := args["user_id"].(float64)
-		if userIDFloat <= 0 {
-			return toolError(rag.ErrCodeInvalidInput, "user_id is required and must be positive")
+		if err := rag.ValidateUserID(int64(userIDFloat)); err != nil {
+			return toolError(rag.ErrCodeInvalidInput, err.Error())
 		}
 		userID := uint(userIDFloat)
 
 		fileName, _ := args["file_name"].(string)
+		if err := rag.ValidateFileName(fileName); err != nil {
+			return toolError(rag.ErrCodeInvalidInput, err.Error())
+		}
 		if fileName == "" {
 			fileName = fileID
 		}
@@ -399,25 +402,33 @@ func (p *RAGToolProvider) indexDocumentTool() Tool {
 }
 
 // isPDFContent 检测内容是否为 base64 编码的 PDF
+// 注意: "base64:" 前缀不代表 PDF，需进一步检查 payload 的 magic bytes
 func isPDFContent(content string) bool {
-	if strings.HasPrefix(content, "base64:") {
-		return true
-	}
 	if strings.HasPrefix(content, "data:application/pdf") {
 		return true
 	}
-	// 尝试检测 base64 编码的 %PDF- 头 (JVBER)
-	trimmed := strings.TrimSpace(content)
+	// 剥离可能的 "base64:" 前缀再检查 PDF magic bytes
+	payload := content
+	if strings.HasPrefix(payload, "base64:") {
+		payload = strings.TrimPrefix(payload, "base64:")
+	}
+	// %PDF- 的 base64 编码始终以 "JVBER" 开头
+	trimmed := strings.TrimSpace(payload)
 	return strings.HasPrefix(trimmed, "JVBER")
 }
 
 // isDOCXContent 检测内容是否为 base64 编码的 DOCX
+// ZIP (PK\x03\x04) 的 base64 为 "UEsDB"，但需检查 DOCX 特征避免匹配普通 ZIP
 func isDOCXContent(content string) bool {
 	if strings.HasPrefix(content, "data:application/vnd.openxmlformats-officedocument") {
 		return true
 	}
-	// base64 编码的 ZIP 文件 (PK\x03\x04) 头部为 "UEsDB"
-	trimmed := strings.TrimSpace(content)
+	// 先检查 ZIP magic bytes
+	payload := content
+	if strings.HasPrefix(payload, "base64:") {
+		payload = strings.TrimPrefix(payload, "base64:")
+	}
+	trimmed := strings.TrimSpace(payload)
 	return strings.HasPrefix(trimmed, "UEsDB")
 }
 
@@ -831,13 +842,13 @@ func (p *RAGToolProvider) deleteDocumentTool() Tool {
 		args := request.GetArguments()
 
 		fileID, _ := args["file_id"].(string)
-		if fileID == "" {
-			return toolError(rag.ErrCodeInvalidInput, "file_id is required")
+		if err := rag.ValidateFileID(fileID); err != nil {
+			return toolError(rag.ErrCodeInvalidInput, err.Error())
 		}
 
 		userIDFloat, _ := args["user_id"].(float64)
-		if userIDFloat <= 0 {
-			return toolError(rag.ErrCodeInvalidInput, "user_id is required and must be positive")
+		if err := rag.ValidateUserID(int64(userIDFloat)); err != nil {
+			return toolError(rag.ErrCodeInvalidInput, err.Error())
 		}
 		userID := uint(userIDFloat)
 

@@ -90,13 +90,49 @@ type ServerConfig struct {
 	ContextCompressor ContextCompressorSection `toml:"context_compressor"`
 }
 
+// TLSSection TLS 加密配置
+type TLSSection struct {
+	Enabled  bool   `toml:"enabled"`
+	CertFile string `toml:"cert_file"`
+	KeyFile  string `toml:"key_file"`
+}
+
 // ServerSection 服务器配置
 type ServerSection struct {
-	Port           int    `toml:"port"`
-	Name           string `toml:"name"`
-	Version        string `toml:"version"`
-	MaxContentSize int    `toml:"max_content_size"`
-	InstanceID     string `toml:"instance_id"`
+	Port           int        `toml:"port"`
+	Name           string     `toml:"name"`
+	Version        string     `toml:"version"`
+	MaxContentSize int        `toml:"max_content_size"`
+	InstanceID     string     `toml:"instance_id"`
+	TLS            TLSSection `toml:"tls"`
+}
+
+// RedactSecrets 返回脱敏后的配置摘要（隐藏 API Key 等敏感信息），
+// 用于启动日志和 /health 端点，防止密钥泄露到日志系统。
+func (c *ServerConfig) RedactSecrets() map[string]interface{} {
+	redact := func(s string) string {
+		if len(s) <= 8 {
+			return "***"
+		}
+		return s[:4] + "***" + s[len(s)-4:]
+	}
+
+	providers := make([]map[string]string, len(c.Providers))
+	for i, p := range c.Providers {
+		providers[i] = map[string]string{
+			"name":     p.Name,
+			"base_url": p.BaseURL,
+			"api_key":  redact(p.APIKey),
+		}
+	}
+
+	return map[string]interface{}{
+		"server":    c.Server.Name + " v" + c.Server.Version,
+		"port":      c.Server.Port,
+		"tls":       c.Server.TLS.Enabled,
+		"redis":     c.Redis.Addr,
+		"providers": providers,
+	}
 }
 
 // RedisSection Redis 配置。
@@ -349,6 +385,21 @@ func (d *Duration) UnmarshalText(text []byte) error {
 	return err
 }
 
+// resolveEnvFields 批量解析多个字符串指针中的 ${VAR} 环境变量占位符。
+// DRY 工具函数，消除 Rerank/HyDE/MultiQuery/ContextCompressor 等多组字段中
+// 重复的 resolveEnvVar 调用模式，将 ~40 行样板代码缩减为单行调用。
+func resolveEnvFields(fields ...*string) []string {
+	var allMissing []string
+	for _, f := range fields {
+		if f != nil && *f != "" {
+			resolved, missing := resolveEnvVar(*f)
+			*f = resolved
+			allMissing = append(allMissing, missing...)
+		}
+	}
+	return allMissing
+}
+
 // envVarPattern 匹配 ${VAR_NAME} 占位符语法。
 // 选择 ${} 而非 $VAR 是为了避免与 shell 变量展开冲突，
 // 且大括号明确界定了变量名边界，适合出现在 URL 等复杂字符串中。
@@ -431,73 +482,20 @@ func LoadConfig(path string) (*ServerConfig, error) {
 	cfg.Redis.Password = resolved
 	allMissing = append(allMissing, missing...)
 
-	// Rerank — base_url / api_key / model 环境变量解析
-	if cfg.Rerank.BaseURL != "" {
-		resolved, missing := resolveEnvVar(cfg.Rerank.BaseURL)
-		cfg.Rerank.BaseURL = resolved
-		allMissing = append(allMissing, missing...)
-	}
-	if cfg.Rerank.APIKey != "" {
-		resolved, missing := resolveEnvVar(cfg.Rerank.APIKey)
-		cfg.Rerank.APIKey = resolved
-		allMissing = append(allMissing, missing...)
-	}
-	if cfg.Rerank.Model != "" {
-		resolved, missing := resolveEnvVar(cfg.Rerank.Model)
-		cfg.Rerank.Model = resolved
-		allMissing = append(allMissing, missing...)
-	}
-
-	// HyDE — base_url / api_key / model 环境变量解析
-	if cfg.HyDE.BaseURL != "" {
-		resolved, missing := resolveEnvVar(cfg.HyDE.BaseURL)
-		cfg.HyDE.BaseURL = resolved
-		allMissing = append(allMissing, missing...)
-	}
-	if cfg.HyDE.APIKey != "" {
-		resolved, missing := resolveEnvVar(cfg.HyDE.APIKey)
-		cfg.HyDE.APIKey = resolved
-		allMissing = append(allMissing, missing...)
-	}
-	if cfg.HyDE.Model != "" {
-		resolved, missing := resolveEnvVar(cfg.HyDE.Model)
-		cfg.HyDE.Model = resolved
-		allMissing = append(allMissing, missing...)
-	}
-
-	// Multi-Query — base_url / api_key / model 环境变量解析
-	if cfg.MultiQuery.BaseURL != "" {
-		resolved, missing := resolveEnvVar(cfg.MultiQuery.BaseURL)
-		cfg.MultiQuery.BaseURL = resolved
-		allMissing = append(allMissing, missing...)
-	}
-	if cfg.MultiQuery.APIKey != "" {
-		resolved, missing := resolveEnvVar(cfg.MultiQuery.APIKey)
-		cfg.MultiQuery.APIKey = resolved
-		allMissing = append(allMissing, missing...)
-	}
-	if cfg.MultiQuery.Model != "" {
-		resolved, missing := resolveEnvVar(cfg.MultiQuery.Model)
-		cfg.MultiQuery.Model = resolved
-		allMissing = append(allMissing, missing...)
-	}
-
-	// Context Compressor — base_url / api_key / model 环境变量解析
-	if cfg.ContextCompressor.BaseURL != "" {
-		resolved, missing := resolveEnvVar(cfg.ContextCompressor.BaseURL)
-		cfg.ContextCompressor.BaseURL = resolved
-		allMissing = append(allMissing, missing...)
-	}
-	if cfg.ContextCompressor.APIKey != "" {
-		resolved, missing := resolveEnvVar(cfg.ContextCompressor.APIKey)
-		cfg.ContextCompressor.APIKey = resolved
-		allMissing = append(allMissing, missing...)
-	}
-	if cfg.ContextCompressor.Model != "" {
-		resolved, missing := resolveEnvVar(cfg.ContextCompressor.Model)
-		cfg.ContextCompressor.Model = resolved
-		allMissing = append(allMissing, missing...)
-	}
+	// 使用 resolveEnvFields 批量解析 LLM 相关字段的环境变量
+	// DRY: 消除 Rerank/HyDE/MultiQuery/ContextCompressor 重复代码
+	allMissing = append(allMissing, resolveEnvFields(
+		&cfg.Rerank.BaseURL, &cfg.Rerank.APIKey, &cfg.Rerank.Model,
+	)...)
+	allMissing = append(allMissing, resolveEnvFields(
+		&cfg.HyDE.BaseURL, &cfg.HyDE.APIKey, &cfg.HyDE.Model,
+	)...)
+	allMissing = append(allMissing, resolveEnvFields(
+		&cfg.MultiQuery.BaseURL, &cfg.MultiQuery.APIKey, &cfg.MultiQuery.Model,
+	)...)
+	allMissing = append(allMissing, resolveEnvFields(
+		&cfg.ContextCompressor.BaseURL, &cfg.ContextCompressor.APIKey, &cfg.ContextCompressor.Model,
+	)...)
 
 	// Graph RAG — Neo4j 密码 + LLM Extractor (base_url / api_key / model) 环境变量解析
 	if cfg.GraphRAG.Neo4j.Password != "" {

@@ -493,6 +493,10 @@ func deduplicateByParent(results []RetrievalResult) []RetrievalResult {
 		key := res.FileID + ":" + res.ParentChunkID
 		if !seen[key] {
 			seen[key] = true
+			// 父子块模式: 保存匹配的子块内容，便于调用方展示命中片段
+			if res.MatchedChildContent == "" {
+				res.MatchedChildContent = res.Content
+			}
 			deduped = append(deduped, res)
 		}
 	}
@@ -851,14 +855,15 @@ func generateUserIndexPrefix(template string, userID uint) string {
 //
 // isKnownProbeQuery 判断是否为 MCP 客户端（如 Cursor）的已知高频探测查询。
 // 这些查询每隔 1-2 分钟周期性发送，用 Debug 级别记录避免日志刷屏。
+// 预编译正则表达式，避免每次调用时重复编译
+var compareAndRe = regexp.MustCompile(`(?i)^compare\s+and\s*$`)
+
 func isKnownProbeQuery(query string) bool {
 	lower := strings.ToLower(strings.TrimSpace(query))
 	switch lower {
 	case "unknown task", "unknown topic", "unknown question":
 		return true
 	}
-	// "Compare  and " 的各种空格变体
-	compareAndRe := regexp.MustCompile(`(?i)^compare\s+and\s*$`)
 	return compareAndRe.MatchString(strings.TrimSpace(query))
 }
 
@@ -887,8 +892,7 @@ func isValidQuery(query string) bool {
 		}
 	}
 
-	// "Compare  and " 的宽松匹配："compare" + 大量空格 + "and" + 可选空格
-	compareAndRe := regexp.MustCompile(`(?i)^compare\s+and\s*$`)
+	// "Compare  and " 的宽松匹配：复用预编译的正则
 	if compareAndRe.MatchString(trimmed) {
 		return false
 	}
