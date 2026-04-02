@@ -29,6 +29,9 @@ COPY --from=builder /app/rag-mcp-server .
 # 复制配置文件
 COPY config.toml .
 
+# 创建上传暂存目录
+RUN mkdir -p /tmp/rag-uploads
+
 # 暴露服务端口 (与 config.toml [server].port 保持一致)
 EXPOSE 8083
 

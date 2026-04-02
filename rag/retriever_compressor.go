@@ -51,6 +51,7 @@ type CompressorConfig struct {
 	APIKey         string        `toml:"api_key"`  // LLM 类型需要
 	Model          string        `toml:"model"`    // LLM 类型需要
 	Timeout        time.Duration `toml:"timeout"`
+	MaxConcurrency int           `toml:"max_concurrency"`  // LLM 类型: 最大并发压缩数（0 表示不限制）
 	SimilarityTopN int           `toml:"similarity_top_n"` // Embedding 类型: 每个 chunk 保留前 N 个最相关句子
 	MinSimilarity  float64       `toml:"min_similarity"`   // Embedding 类型: 最低相似度阈值
 }
@@ -60,7 +61,8 @@ func DefaultCompressorConfig() CompressorConfig {
 	return CompressorConfig{
 		Enabled:        false,
 		Type:           "embedding",
-		Timeout:        15 * time.Second,
+		Timeout:        30 * time.Second,
+		MaxConcurrency: 5,
 		SimilarityTopN: 5,
 		MinSimilarity:  0.3,
 	}
@@ -75,16 +77,21 @@ func DefaultCompressorConfig() CompressorConfig {
 type LLMCompressor struct {
 	config     CompressorConfig
 	httpClient *http.Client
+	sem        chan struct{} // 并发限制信号量
 }
 
 // NewLLMCompressor 创建 LLM 压缩器
 func NewLLMCompressor(cfg CompressorConfig) *LLMCompressor {
 	if cfg.Timeout <= 0 {
-		cfg.Timeout = 15 * time.Second
+		cfg.Timeout = 30 * time.Second
+	}
+	if cfg.MaxConcurrency <= 0 {
+		cfg.MaxConcurrency = 5
 	}
 	return &LLMCompressor{
 		config:     cfg,
 		httpClient: &http.Client{Timeout: cfg.Timeout},
+		sem:        make(chan struct{}, cfg.MaxConcurrency),
 	}
 }
 
@@ -108,9 +115,18 @@ func (c *LLMCompressor) Compress(ctx context.Context, query string, results []Re
 
 	ch := make(chan compressResult, len(results))
 
-	// ── 并发扇出: 所有 chunk 同时压缩 ──
+	// ── 并发扇出: 通过 semaphore 限制最大并发数，避免对 LLM API 造成瞬时压力 ──
 	for i, r := range results {
 		go func(idx int, content string) {
+			// 获取信号量令牌，达到上限时阻塞等待
+			select {
+			case c.sem <- struct{}{}:
+			case <-ctx.Done():
+				ch <- compressResult{index: idx, err: ctx.Err()}
+				return
+			}
+			defer func() { <-c.sem }() // 释放令牌
+
 			compressed, err := c.compressChunk(ctx, query, content)
 			ch <- compressResult{index: idx, content: compressed, err: err}
 		}(i, r.Content)
@@ -354,7 +370,8 @@ func InitGlobalCompressor(cfg CompressorConfig) ContextCompressor {
 	switch cfg.Type {
 	case "llm":
 		globalCompressor = NewLLMCompressor(cfg)
-		logrus.Infof("[Compressor] LLM compressor initialized (model=%s)", cfg.Model)
+		logrus.Infof("[Compressor] LLM compressor initialized (model=%s, timeout=%s, maxConcurrency=%d)",
+			cfg.Model, cfg.Timeout, cfg.MaxConcurrency)
 	case "embedding":
 		globalCompressor = NewEmbeddingSimilarityCompressor(cfg)
 		logrus.Infof("[Compressor] Embedding similarity compressor initialized (topN=%d, minSim=%.2f)",

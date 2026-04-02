@@ -26,14 +26,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 
 	"mcp_rag_server/rag"
 	"mcp_rag_server/tools"
 
 	"github.com/mark3labs/mcp-go/server"
 	redisCli "github.com/redis/go-redis/v9"
+	"github.com/sirupsen/logrus"
 )
 
 // NewMCPServer 创建 MCP 服务器
@@ -55,12 +59,19 @@ func NewMCPServerWithGraphRAG(cfg *ServerConfig, redisClient redisCli.UniversalC
 	retCfg := cfg.ToRetrieverConfig()
 	chunkCfg := cfg.ToChunkingConfig()
 	rerankCfg := cfg.ToRerankConfig()
+	uploadCfg := cfg.ToUploadConfig()
 
 	// VectorStore 多后端工厂
 	store := CreateVectorStore(cfg, redisClient)
 
+	// UploadStore：如果启用，创建并传入工具层
+	var uploadStore *rag.UploadStore
+	if uploadCfg.Enabled {
+		uploadStore = rag.NewUploadStore(redisClient, uploadCfg)
+	}
+
 	registry := tools.NewRegistry()
-	tools.RegisterAllRAGTools(registry, store, retCfg, chunkCfg, rerankCfg, cfg.Server.MaxContentSize, taskQueue, graphStore, extractor)
+	tools.RegisterAllRAGTools(registry, store, retCfg, chunkCfg, rerankCfg, cfg.Server.MaxContentSize, taskQueue, uploadStore, uploadCfg, graphStore, extractor)
 	registry.ApplyToServer(mcpServer)
 
 	return mcpServer
@@ -115,14 +126,115 @@ func StartServer(cfg *ServerConfig, redisClient redisCli.UniversalClient, taskQu
 	return StartServerWithGraphRAG(cfg, redisClient, taskQueue, nil, nil)
 }
 
-// StartServerWithGraphRAG 启动 MCP 服务器（支持 Graph RAG）
+// StartServerWithGraphRAG 启动 MCP 服务器（支持 Graph RAG + 文件上传）
 func StartServerWithGraphRAG(cfg *ServerConfig, redisClient redisCli.UniversalClient, taskQueue *rag.TaskQueue, graphStore rag.GraphStore, extractor rag.EntityExtractor) error {
+	return StartServerFull(cfg, redisClient, taskQueue, graphStore, extractor, nil)
+}
+
+// StartServerFull 启动 MCP 服务器（完整版：支持 Graph RAG + 文件上传）
+func StartServerFull(cfg *ServerConfig, redisClient redisCli.UniversalClient, taskQueue *rag.TaskQueue, graphStore rag.GraphStore, extractor rag.EntityExtractor, uploadStore *rag.UploadStore) error {
 	mcpServer := NewMCPServerWithGraphRAG(cfg, redisClient, taskQueue, graphStore, extractor)
 	httpServer := server.NewStreamableHTTPServer(mcpServer)
 
+	// 组合路由：MCP 端点 + 文件上传端点
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", httpServer)
+
+	if uploadStore != nil {
+		mux.HandleFunc("/upload", handleFileUpload(uploadStore))
+		logrus.Infof("[Upload] POST /upload enabled (max=%dMB)",
+			uploadStore.GetConfig().MaxUploadSize/(1024*1024))
+	}
+
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
 	log.Printf("RAG MCP Server listening on %s/mcp", addr)
-	return httpServer.Start(addr)
+
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+	return srv.ListenAndServe()
+}
+
+// handleFileUpload 处理文件上传请求
+// POST /upload  (multipart/form-data)
+//   - file: 文件二进制 (必须)
+//   - file_name: 文件名 (可选，默认从 multipart header 取)
+//
+// 响应: {"upload_id": "upl_xxxx", "size": 15728640, "expires_in": 3600}
+func handleFileUpload(uploadStore *rag.UploadStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		maxSize := uploadStore.GetConfig().MaxUploadSize
+		r.Body = http.MaxBytesReader(w, r.Body, maxSize)
+
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			logrus.Warnf("[Upload] Parse multipart failed: %v", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": fmt.Sprintf("invalid multipart form or file too large (max %dMB)",
+					maxSize/(1024*1024)),
+			})
+			return
+		}
+
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "file field is required"})
+			return
+		}
+		defer file.Close()
+
+		data, err := io.ReadAll(file)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "failed to read file"})
+			return
+		}
+
+		// 文件名：优先用表单字段，其次用 multipart header
+		fileName := r.FormValue("file_name")
+		if fileName == "" {
+			fileName = header.Filename
+		}
+
+		format := string(rag.DetectFormatByFileName(fileName))
+
+		uploadID := uploadStore.GenerateID()
+		meta := rag.UploadMeta{
+			FileName: fileName,
+			Format:   format,
+		}
+
+		ctx := r.Context()
+		if err := uploadStore.Save(ctx, uploadID, data, meta); err != nil {
+			logrus.Errorf("[Upload] Save failed: %v", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "failed to save upload"})
+			return
+		}
+
+		ttlSeconds := int(uploadStore.GetConfig().TTL.Seconds())
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"upload_id":  uploadID,
+			"file_name":  fileName,
+			"format":     format,
+			"size":       len(data),
+			"expires_in": ttlSeconds,
+		})
+	}
 }
 
 // InitEmbeddingManager 初始化 Embedding 管理器

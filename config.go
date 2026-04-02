@@ -85,6 +85,7 @@ type ServerConfig struct {
 	HyDE              HyDESection              `toml:"hyde"`
 	VectorStore       *VectorStoreSection      `toml:"vector_store"`
 	GraphRAG          GraphRAGSection          `toml:"graph_rag"`
+	Upload            UploadSection            `toml:"upload"`
 	MultiQuery        MultiQuerySection        `toml:"multi_query"`
 	ContextCompressor ContextCompressorSection `toml:"context_compressor"`
 }
@@ -291,6 +292,15 @@ type QdrantSection struct {
 	Addr    string   `toml:"addr"`
 	APIKey  string   `toml:"api_key"`
 	Timeout Duration `toml:"timeout"`
+}
+
+// UploadSection 文件上传配置
+type UploadSection struct {
+	Enabled            bool     `toml:"enabled"`
+	MaxUploadSize      int64    `toml:"max_upload_size"`
+	DiskPath           string   `toml:"disk_path"`
+	TTL                Duration `toml:"ttl"`
+	AutoAsyncThreshold int      `toml:"auto_async_threshold"`
 }
 
 // GraphRAGSection Graph RAG 配置
@@ -1088,6 +1098,25 @@ func (c *ServerConfig) ToMigrationConfig() rag.MigrationConfig {
 	}
 	if c.Migration.BatchSize > 0 {
 		cfg.BatchSize = c.Migration.BatchSize
+	}
+	return cfg
+}
+
+// ToUploadConfig 转换为 rag.UploadConfig
+func (c *ServerConfig) ToUploadConfig() rag.UploadConfig {
+	cfg := rag.DefaultUploadConfig()
+	cfg.Enabled = c.Upload.Enabled
+	if c.Upload.MaxUploadSize > 0 {
+		cfg.MaxUploadSize = c.Upload.MaxUploadSize
+	}
+	if c.Upload.DiskPath != "" {
+		cfg.DiskPath = c.Upload.DiskPath
+	}
+	if c.Upload.TTL.Duration > 0 {
+		cfg.TTL = c.Upload.TTL.Duration
+	}
+	if c.Upload.AutoAsyncThreshold > 0 {
+		cfg.AutoAsyncThreshold = c.Upload.AutoAsyncThreshold
 	}
 	return cfg
 }

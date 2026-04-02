@@ -130,6 +130,16 @@ func main() {
 		}
 	}
 
+	// 文件上传暂存服务（可选）
+	var uploadStore *rag.UploadStore
+	uploadCfg := cfg.ToUploadConfig()
+	if uploadCfg.Enabled {
+		uploadStore = rag.NewUploadStore(redisClient, uploadCfg)
+		uploadStore.StartCleaner(context.Background())
+		logrus.Infof("文件上传已启用: max=%dMB, disk=%s, ttl=%s",
+			uploadCfg.MaxUploadSize/(1024*1024), uploadCfg.DiskPath, uploadCfg.TTL)
+	}
+
 	logrus.Infof("正在启动 RAG MCP Server (Port: %d)...", cfg.Server.Port)
 	logrus.Infof("索引算法: %s | 混合检索: %v | 结构感知分块: %v | Rerank: %v | 异步索引: %v | Graph RAG: %v",
 		cfg.Retriever.IndexAlgorithm, cfg.Retriever.HybridSearchEnabled,
@@ -138,7 +148,7 @@ func main() {
 	// 在独立 goroutine 中启动 HTTP 服务器，主 goroutine 用于信号监听
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- StartServerWithGraphRAG(cfg, redisClient, taskQueue, graphStore, entityExtractor)
+		errCh <- StartServerFull(cfg, redisClient, taskQueue, graphStore, entityExtractor, uploadStore)
 	}()
 
 	logrus.Info("----------------------------------------")
@@ -160,6 +170,9 @@ func main() {
 
 	// 关闭顺序：Worker → Manager → Redis，确保 in-flight 任务完成后再断开连接
 	logrus.Info("正在清理资源...")
+	if uploadStore != nil {
+		uploadStore.Stop()
+	}
 	if indexWorker != nil {
 		indexWorker.Stop() // 内部调用 cancel + wg.Wait，等待所有 goroutine 退出
 	}

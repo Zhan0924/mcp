@@ -196,6 +196,14 @@ timeout = "15s"
 similarity_top_n = 5             # 每个 chunk 保留前 N 个最相关句子
 min_similarity = 0.3             # 最低相似度阈值，低于则丢弃
 
+# 文件上传 — 绕过 MCP JSON 协议大小限制，支持大文件索引
+[upload]
+enabled = true
+max_upload_size = 104857600    # 100MB
+disk_path = "/tmp/rag-uploads"
+ttl = "1h"
+auto_async_threshold = 102400  # 100KB 以上自动异步
+
 # Graph RAG — 知识图谱增强的 RAG
 # 从文档中提取实体和关系，构建知识图谱，支持多跳推理和关系查询
 # 图存储后端: memory (内存，重启丢失) / neo4j (持久化，生产推荐)

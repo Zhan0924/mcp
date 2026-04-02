@@ -23,6 +23,7 @@ package tools
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -53,10 +54,12 @@ type RAGToolProvider struct {
 	taskQueue       *rag.TaskQueue      // nil 表示未启用异步索引
 	graphStore      rag.GraphStore      // nil 表示未启用 Graph RAG
 	entityExtractor rag.EntityExtractor // nil 表示未启用实体提取
+	uploadStore     *rag.UploadStore    // nil 表示未启用文件上传
+	uploadCfg       rag.UploadConfig    // 上传配置（auto-async 阈值等）
 }
 
 // NewRAGToolProvider 创建 RAG 工具提供者
-func NewRAGToolProvider(store rag.VectorStore, retCfg *rag.RetrieverConfig, chunkCfg *rag.ChunkingConfig, rerankCfg rag.RerankConfig, maxContentSize int, taskQueue *rag.TaskQueue, graphStore rag.GraphStore, extractor rag.EntityExtractor) *RAGToolProvider {
+func NewRAGToolProvider(store rag.VectorStore, retCfg *rag.RetrieverConfig, chunkCfg *rag.ChunkingConfig, rerankCfg rag.RerankConfig, maxContentSize int, taskQueue *rag.TaskQueue, graphStore rag.GraphStore, extractor rag.EntityExtractor, uploadStore *rag.UploadStore, uploadCfg rag.UploadConfig) *RAGToolProvider {
 	if maxContentSize <= 0 {
 		maxContentSize = 10 * 1024 * 1024
 	}
@@ -69,6 +72,8 @@ func NewRAGToolProvider(store rag.VectorStore, retCfg *rag.RetrieverConfig, chun
 		taskQueue:       taskQueue,
 		graphStore:      graphStore,
 		entityExtractor: extractor,
+		uploadStore:     uploadStore,
+		uploadCfg:       uploadCfg,
 	}
 }
 
@@ -239,8 +244,9 @@ func (p *RAGToolProvider) searchTool() Tool {
 
 func (p *RAGToolProvider) indexDocumentTool() Tool {
 	toolOpts := []mcp.ToolOption{
-		mcp.WithDescription("文档索引：将文档分块、向量化并存入向量索引。支持纯文本、Markdown、HTML、PDF、DOCX 格式，自动识别表格和图片，结构感知分块。PDF/DOCX 内容需 base64 编码传入。设置 async=true 可异步执行，立即返回 task_id。如需索引网页，请使用 rag_index_url 工具。"),
-		mcp.WithString("content", mcp.Description("文档内容（PDF/DOCX 为 base64 编码）"), mcp.Required()),
+		mcp.WithDescription("文档索引：将文档分块、向量化并存入向量索引。支持纯文本、Markdown、HTML、PDF、DOCX 格式，自动识别表格和图片，结构感知分块。PDF/DOCX 内容需 base64 编码传入。设置 async=true 可异步执行，立即返回 task_id。如需索引网页，请使用 rag_index_url 工具。大文件可先通过 POST /upload 上传，再传入 upload_id。"),
+		mcp.WithString("content", mcp.Description("文档内容（PDF/DOCX 为 base64 编码）。与 upload_id 二选一，小文件直接传内容，大文件用 upload_id")),
+		mcp.WithString("upload_id", mcp.Description("上传文件 ID（通过 POST /upload 获取，与 content 二选一，大文件使用）")),
 		mcp.WithString("file_id", mcp.Description("文件唯一标识"), mcp.Required()),
 		mcp.WithNumber("user_id", mcp.Description("用户 ID"), mcp.Required()),
 		mcp.WithString("file_name", mcp.Description("文件名（可选）")),
@@ -259,15 +265,6 @@ func (p *RAGToolProvider) indexDocumentTool() Tool {
 		defer cancel()
 
 		args := request.GetArguments()
-
-		content, _ := args["content"].(string)
-		if content == "" {
-			return toolError(rag.ErrCodeInvalidInput, "content is required")
-		}
-		if len(content) > p.maxContentSize {
-			return toolError(rag.ErrCodeContentTooLarge,
-				fmt.Sprintf("%d bytes (max %d)", len(content), p.maxContentSize))
-		}
 
 		fileID, _ := args["file_id"].(string)
 		if fileID == "" {
@@ -289,16 +286,65 @@ func (p *RAGToolProvider) indexDocumentTool() Tool {
 
 		// 异步模式：提交到 TaskQueue 立即返回（不阻塞索引过程）
 		asyncMode, _ := args["async"].(bool)
+
+		content, _ := args["content"].(string)
+		uploadID, _ := args["upload_id"].(string)
+
+		// upload_id 模式：从 UploadStore 加载文件内容
+		if uploadID != "" && p.uploadStore != nil {
+			data, meta, loadErr := p.uploadStore.Load(ctx, uploadID)
+			if loadErr != nil {
+				return toolError(rag.ErrCodeInvalidInput, "upload not found or expired: "+uploadID)
+			}
+			// 根据格式决定内容处理方式
+			detectedFmt := rag.DetectFormatByFileName(meta.FileName)
+			if detectedFmt == rag.FormatPDF || detectedFmt == rag.FormatDOCX {
+				// 二进制格式: base64 编码后走现有解析流程
+				content = base64Encode(data)
+			} else {
+				content = string(data)
+			}
+			if fileName == "" || fileName == fileID {
+				fileName = meta.FileName
+			}
+			if format == "" {
+				format = meta.Format
+			}
+			logrus.Infof("[rag_index_document] Loaded upload %s: size=%d, file=%s", uploadID, len(data), meta.FileName)
+			// 加载成功后异步删除暂存
+			go p.uploadStore.Delete(context.Background(), uploadID)
+		}
+
+		if content == "" {
+			return toolError(rag.ErrCodeInvalidInput, "content or upload_id is required")
+		}
+		if len(content) > p.maxContentSize {
+			return toolError(rag.ErrCodeContentTooLarge,
+				fmt.Sprintf("%d bytes (max %d)", len(content), p.maxContentSize))
+		}
+
+		// 智能异步：内容超过阈值时自动切换异步模式
+		autoAsync := false
+		if p.uploadCfg.AutoAsyncThreshold > 0 && len(content) > p.uploadCfg.AutoAsyncThreshold && p.taskQueue != nil && !asyncMode {
+			autoAsync = true
+			asyncMode = true
+			logrus.Infof("[rag_index_document] Auto-async: content size %d > threshold %d",
+				len(content), p.uploadCfg.AutoAsyncThreshold)
+		}
 		if asyncMode && p.taskQueue != nil {
 			taskID, err := p.taskQueue.Submit(ctx, userID, fileID, fileName, content, format)
 			if err != nil {
 				logrus.Errorf("[rag_index_document] Async submit failed: %v", err)
 				return toolError(rag.ErrCodeBatchFailed, "async submit failed: "+err.Error())
 			}
+			msg := "Document indexing submitted. Use rag_task_status to check progress."
+			if autoAsync {
+				msg = fmt.Sprintf("Large document (%d bytes) auto-submitted for async indexing. Use rag_task_status to check progress.", len(content))
+			}
 			result := map[string]interface{}{
 				"task_id": taskID,
 				"status":  rag.TaskStatusPending,
-				"message": "Document indexing submitted. Use rag_task_status to check progress.",
+				"message": msg,
 			}
 			data, _ := json.MarshalIndent(result, "", "  ")
 			return mcp.NewToolResultText(string(data)), nil
@@ -1042,8 +1088,13 @@ func (p *RAGToolProvider) exportDataTool() Tool {
 	})
 }
 
+// base64Encode 将二进制数据编码为 base64 字符串
+func base64Encode(data []byte) string {
+	return base64.StdEncoding.EncodeToString(data)
+}
+
 // RegisterAllRAGTools 注册所有 RAG 工具、资源和提示词
-func RegisterAllRAGTools(registry *Registry, store rag.VectorStore, retCfg *rag.RetrieverConfig, chunkCfg *rag.ChunkingConfig, rerankCfg rag.RerankConfig, maxContentSize int, taskQueue *rag.TaskQueue, graphStore ...interface{}) {
+func RegisterAllRAGTools(registry *Registry, store rag.VectorStore, retCfg *rag.RetrieverConfig, chunkCfg *rag.ChunkingConfig, rerankCfg rag.RerankConfig, maxContentSize int, taskQueue *rag.TaskQueue, uploadStore *rag.UploadStore, uploadCfg rag.UploadConfig, graphStore ...interface{}) {
 	var gs rag.GraphStore
 	var ee rag.EntityExtractor
 	if len(graphStore) >= 1 && graphStore[0] != nil {
@@ -1052,7 +1103,7 @@ func RegisterAllRAGTools(registry *Registry, store rag.VectorStore, retCfg *rag.
 	if len(graphStore) >= 2 && graphStore[1] != nil {
 		ee, _ = graphStore[1].(rag.EntityExtractor)
 	}
-	registry.RegisterProvider(NewRAGToolProvider(store, retCfg, chunkCfg, rerankCfg, maxContentSize, taskQueue, gs, ee))
+	registry.RegisterProvider(NewRAGToolProvider(store, retCfg, chunkCfg, rerankCfg, maxContentSize, taskQueue, gs, ee, uploadStore, uploadCfg))
 	registry.RegisterProvider(NewRAGResourceProvider(store, retCfg))
 	registry.RegisterProvider(NewRAGPromptProvider(store, retCfg, chunkCfg, rerankCfg))
 }
